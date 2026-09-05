@@ -214,18 +214,34 @@ static const I2S_Type *i2s_base_ptr[] = I2S_BASE_PTRS;
 static const dma_request_source_t i2s_dma_req_src_tx[] = I2S_DMA_REQ_SRC_TX;
 static const dma_request_source_t i2s_dma_req_src_rx[] = I2S_DMA_REQ_SRC_RX;
 static const gpio_map_t i2s_gpio_map[] = I2S_GPIO_MAP;
-AT_NONCACHEABLE_SECTION_ALIGN(edma_tcd_t edmaTcd[MICROPY_HW_I2S_NUM], 32);
+
+// Upstream previously tracked one live I2S object per i2s_id, with TX and RX mutually
+// exclusive: constructing the second direction on an id silently deinitialized -- and
+// destroyed the DMA state of -- whichever direction was already there. The SAI hardware
+// itself genuinely supports simultaneous TX+RX in synchronous mode (the cross-direction
+// sync-mode branches in i2s_init() already configure it correctly on every construction
+// call, regardless of order). Track one object per (id, direction) pair instead, so a
+// second direction on the same id can coexist with the first.
+#define I2S_OBJ_SLOT(i2s_id, mode) (((i2s_id) - 1) * 2 + (mode))
+#define I2S_NUM_OBJ_SLOTS (MICROPY_HW_I2S_NUM * 2)
+
+static inline machine_i2s_obj_t *i2s_peer(mp_int_t i2s_id, i2s_mode_t mode) {
+    machine_i2s_obj_t *peer = MP_STATE_PORT(machine_i2s_obj)[I2S_OBJ_SLOT(i2s_id, mode == TX ? RX : TX)];
+    return (peer != NULL && peer->i2s_inst != NULL) ? peer : NULL;
+}
+
+AT_NONCACHEABLE_SECTION_ALIGN(edma_tcd_t edmaTcd[I2S_NUM_OBJ_SLOTS], 32);
 
 // called on processor reset
 void machine_i2s_init0() {
-    for (uint8_t i = 0; i < MICROPY_HW_I2S_NUM; i++) {
+    for (uint8_t i = 0; i < I2S_NUM_OBJ_SLOTS; i++) {
         MP_STATE_PORT(machine_i2s_obj)[i] = NULL;
     }
 }
 
 // called on soft reboot
 void machine_i2s_deinit_all(void) {
-    for (uint8_t i = 0; i < MICROPY_HW_I2S_NUM; i++) {
+    for (uint8_t i = 0; i < I2S_NUM_OBJ_SLOTS; i++) {
         machine_i2s_obj_t *i2s_obj = MP_STATE_PORT(machine_i2s_obj)[i];
         if (i2s_obj != NULL) {
             machine_i2s_deinit(i2s_obj);
@@ -486,6 +502,22 @@ static bool i2s_init(machine_i2s_obj_t *self) {
         #endif
     }
 
+    // If the opposite direction is already live on this id, we must not disturb its
+    // running DMA/FIFO state: skip the whole-peripheral SAI_Init() below, and skip
+    // re-configuring (and thereby resetting) the peer's own direction in the
+    // cross-mode branches further down. If a *same*-direction object is being replaced
+    // (e.g. re-running I2S(1, mode=TX, ...) while an old TX is still registered), deinit
+    // it first, same as the original behavior -- but scoped to just that direction, not
+    // the whole peripheral, if a peer exists.
+    machine_i2s_obj_t *peer = i2s_peer(self->i2s_id, self->mode);
+    uint8_t my_slot = I2S_OBJ_SLOT(self->i2s_id, self->mode);
+    machine_i2s_obj_t *existing_same_direction = MP_STATE_PORT(machine_i2s_obj)[my_slot];
+    if (existing_same_direction != NULL && existing_same_direction != self) {
+        machine_i2s_deinit(MP_OBJ_FROM_PTR(existing_same_direction));
+    }
+    self->edmaTcd = &edmaTcd[my_slot];
+    MP_STATE_PORT(machine_i2s_obj)[my_slot] = self;
+
     self->dma_channel = allocate_dma_channel();
 
     DMAMUX_Init(DMAMUX);
@@ -501,7 +533,12 @@ static bool i2s_init(machine_i2s_obj_t *self) {
     EDMA_SetCallback(&self->edmaHandle, edma_i2s_callback, self);
     EDMA_ResetChannel(DMA0, self->dma_channel);
 
-    SAI_Init(self->i2s_inst);
+    // SAI_Init() unconditionally clears both TCSR and RCSR's DMA-request-enable bits --
+    // fatal to an already-running peer's DMA feed. Only the first direction on this id
+    // needs to bring the peripheral up at all.
+    if (peer == NULL) {
+        SAI_Init(self->i2s_inst);
+    }
 
     sai_transceiver_t saiConfig;
     SAI_GetClassicI2SConfig(&saiConfig, get_dma_bits(self->mode, self->bits), kSAI_Stereo, kSAI_Channel0Mask);
@@ -517,14 +554,21 @@ static bool i2s_init(machine_i2s_obj_t *self) {
         saiConfig.syncMode = kSAI_ModeAsync;
         SAI_RxSetConfig(self->i2s_inst, &saiConfig);
     } else if ((self->mode == TX) && (i2s_gpio_map[sck_index].mode == RX)) {
-        saiConfig.syncMode = kSAI_ModeAsync;
-        SAI_RxSetConfig(self->i2s_inst, &saiConfig);
+        // Only touch RX's own registers here if RX isn't already an active peer --
+        // SAI_RxSetConfig starts with a full destructive SAI_RxReset.
+        if (peer == NULL) {
+            saiConfig.syncMode = kSAI_ModeAsync;
+            SAI_RxSetConfig(self->i2s_inst, &saiConfig);
+        }
         saiConfig.bitClock.bclkSrcSwap = true;
         saiConfig.syncMode = kSAI_ModeSync;
         SAI_TxSetConfig(self->i2s_inst, &saiConfig);
     } else if ((self->mode == RX) && (i2s_gpio_map[sck_index].mode == TX)) {
-        saiConfig.syncMode = kSAI_ModeAsync;
-        SAI_TxSetConfig(self->i2s_inst, &saiConfig);
+        // Mirror of the above -- don't reset an active TX peer.
+        if (peer == NULL) {
+            saiConfig.syncMode = kSAI_ModeAsync;
+            SAI_TxSetConfig(self->i2s_inst, &saiConfig);
+        }
         saiConfig.syncMode = kSAI_ModeSync;
         SAI_RxSetConfig(self->i2s_inst, &saiConfig);
     } else {
@@ -678,18 +722,13 @@ static machine_i2s_obj_t *mp_machine_i2s_make_new_instance(mp_int_t i2s_id) {
         mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("I2S(%d) does not exist"), i2s_id);
     }
 
-    uint8_t i2s_id_zero_base = i2s_id - 1;
-
-    machine_i2s_obj_t *self;
-    if (MP_STATE_PORT(machine_i2s_obj)[i2s_id_zero_base] == NULL) {
-        self = mp_obj_malloc(machine_i2s_obj_t, &machine_i2s_type);
-        MP_STATE_PORT(machine_i2s_obj)[i2s_id_zero_base] = self;
-        self->i2s_id = i2s_id;
-        self->edmaTcd = &edmaTcd[i2s_id_zero_base];
-    } else {
-        self = MP_STATE_PORT(machine_i2s_obj)[i2s_id_zero_base];
-        machine_i2s_deinit(MP_OBJ_FROM_PTR(self));
-    }
+    // Object allocation and (id, direction) slot registration is now deferred to
+    // i2s_init(), once self->mode is known (this function only receives i2s_id, not
+    // mode) -- see I2S_OBJ_SLOT above. Always allocate a fresh object here; i2s_init()
+    // finds and deinits any existing object in the same (id, mode) slot.
+    machine_i2s_obj_t *self = mp_obj_malloc(machine_i2s_obj_t, &machine_i2s_type);
+    self->i2s_id = i2s_id;
+    self->i2s_inst = NULL;  // not yet initialized; also doubles as the liveness flag
 
     // align DMA buffer to the cache line size (32 bytes)
     self->dma_buffer_dcache_aligned = (uint8_t *)((uint32_t)(self->dma_buffer + 0x1f) & ~0x1f);
@@ -717,7 +756,12 @@ static void mp_machine_i2s_deinit(machine_i2s_obj_t *self) {
             SAI_RxReset(self->i2s_inst);
         }
 
-        SAI_Deinit(self->i2s_inst);
+        // Only fully de-init (and gate the clock of) the shared SAI peripheral if no
+        // peer direction is still active on this id -- otherwise this would silently
+        // kill the peer, the same class of bug fixed in i2s_init() above.
+        if (i2s_peer(self->i2s_id, self->mode) == NULL) {
+            SAI_Deinit(self->i2s_inst);
+        }
         free_dma_channel(self->dma_channel);
         m_free(self->ring_buffer_storage);
         self->i2s_inst = NULL;  // flag object as de-initialized
@@ -728,4 +772,5 @@ static void mp_machine_i2s_irq_update(machine_i2s_obj_t *self) {
     (void)self;
 }
 
-MP_REGISTER_ROOT_POINTER(struct _machine_i2s_obj_t *machine_i2s_obj[MICROPY_HW_I2S_NUM]);
+// One slot per (id, direction) pair -- see I2S_OBJ_SLOT above.
+MP_REGISTER_ROOT_POINTER(struct _machine_i2s_obj_t *machine_i2s_obj[MICROPY_HW_I2S_NUM * 2]);
