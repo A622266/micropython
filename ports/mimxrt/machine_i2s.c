@@ -97,6 +97,10 @@ typedef struct _machine_i2s_obj_t {
     int32_t rate;
     int32_t ibuf;
     mp_obj_t callback_for_non_blocking;
+    // TDM support -- see i2s_num_channels() just below this struct. 0 when format is
+    // MONO/STEREO (SAI_NUM_AUDIO_CHANNELS is used instead); one of 2/4/8/16 when format
+    // is TDM.
+    uint8_t num_slots;
     uint8_t dma_buffer[SIZEOF_DMA_BUFFER_IN_BYTES + 0x1f]; // 0x1f related to D-Cache alignment
     uint8_t *dma_buffer_dcache_aligned;
     ring_buf_t ring_buffer;
@@ -108,6 +112,15 @@ typedef struct _machine_i2s_obj_t {
     edma_handle_t edmaHandle;
     edma_tcd_t *edmaTcd;
 } machine_i2s_obj_t;
+
+// MONO and STEREO both always use a fixed 2-channel frame (MONO's single channel is
+// duplicated into both slots -- see feed_dma()'s existing MONO branches, unchanged by
+// this patch), hence SAI_NUM_AUDIO_CHANNELS staying a fixed 2 for those two formats.
+// TDM's slot count is per-object (self->num_slots: 2/4/8/16), used wherever
+// SAI_NUM_AUDIO_CHANNELS was previously assumed unconditionally -- see i2s_init() below.
+static inline uint8_t i2s_num_channels(machine_i2s_obj_t *self) {
+    return (self->format == TDM) ? self->num_slots : SAI_NUM_AUDIO_CHANNELS;
+}
 
 typedef struct _iomux_table_t {
     uint32_t muxRegister;
@@ -379,7 +392,12 @@ static void feed_dma(machine_i2s_obj_t *self, ping_pong_t dma_ping_pong) {
                     dma_buffer_p[i * 8 + b + 4] = dma_buffer_p[i * 8 + b]; // duplicated mono sample
                 }
             }
-        } else { // STEREO, both 16-bit and 32-bit
+        } else { // STEREO (both 16-bit and 32-bit) and TDM: raw passthrough, no
+                 // remapping/duplication. TDM deliberately falls into this same branch
+                 // unchanged -- the caller is already expected to supply correctly
+                 // slot-interleaved N-channel data, so no new TDM-specific logic is
+                 // needed here, only in the RX-side frame-size math
+                 // (extmod/machine_i2s.c) and i2s_init()'s SAI config above.
             for (uint32_t i = 0; i < SIZEOF_HALF_DMA_BUFFER_IN_BYTES; i++) {
                 ringbuf_pop(&self->ring_buffer, &dma_buffer_p[i]);
             }
@@ -504,7 +522,17 @@ static bool i2s_init(machine_i2s_obj_t *self) {
     SAI_Init(self->i2s_inst);
 
     sai_transceiver_t saiConfig;
-    SAI_GetClassicI2SConfig(&saiConfig, get_dma_bits(self->mode, self->bits), kSAI_Stereo, kSAI_Channel0Mask);
+    // SAI_GetTDMConfig() is the SDK's own convenience initializer for TDM framing
+    // (fsl_sai.h), directly analogous to SAI_GetClassicI2SConfig() used for
+    // MONO/STEREO. kSAI_FrameSyncLenOneBitClk matches what TDM slave devices expect: a
+    // frame sync pulse one BCLK cycle wide at the start of the frame, not classic I2S's
+    // 50%-duty toggle.
+    if (self->format == TDM) {
+        SAI_GetTDMConfig(&saiConfig, kSAI_FrameSyncLenOneBitClk, get_dma_bits(self->mode, self->bits),
+            self->num_slots, kSAI_Channel0Mask);
+    } else {
+        SAI_GetClassicI2SConfig(&saiConfig, get_dma_bits(self->mode, self->bits), kSAI_Stereo, kSAI_Channel0Mask);
+    }
     saiConfig.masterSlave = kSAI_Master;
 
     uint16_t sck_index;
@@ -531,10 +559,12 @@ static bool i2s_init(machine_i2s_obj_t *self) {
         return false; // should never happen
     }
 
+    // Channel count used for BCLK-rate computation must match the actual slot count
+    // (2/4/8/16) for TDM, not always 2. See i2s_num_channels() above.
     SAI_TxSetBitClockRate(self->i2s_inst, clock_freq, self->rate, get_dma_bits(self->mode, self->bits),
-        SAI_NUM_AUDIO_CHANNELS);
+        i2s_num_channels(self));
     SAI_RxSetBitClockRate(self->i2s_inst, clock_freq, self->rate, get_dma_bits(self->mode, self->bits),
-        SAI_NUM_AUDIO_CHANNELS);
+        i2s_num_channels(self));
 
     edma_transfer_config_t transferConfig;
     uint8_t bytes_per_sample = get_dma_bits(self->mode, self->bits) / 8;
@@ -633,8 +663,23 @@ static void mp_machine_i2s_init_helper(machine_i2s_obj_t *self, mp_arg_val_t *ar
     // is Format valid?
     format_t i2s_format = args[ARG_format].u_int;
     if ((i2s_format != MONO) &&
-        (i2s_format != STEREO)) {
+        (i2s_format != STEREO) &&
+        (i2s_format != TDM)) {
         mp_raise_ValueError(MP_ERROR_TEXT("invalid format"));
+    }
+
+    // slots is only meaningful (and required) when format=TDM; ignored otherwise,
+    // matching how mck is optional depending on context. Restricted to 2/4/8/16 -- the
+    // SAI hardware's own supported TDM slot counts (fsl_sai.h's SAI_GetTDMConfig() takes
+    // an arbitrary dataWordNum, but this restricts to the widths meaningful for common
+    // TDM audio devices).
+    uint8_t i2s_num_slots = 0;
+    if (i2s_format == TDM) {
+        mp_int_t slots = args[ARG_slots].u_int;
+        if ((slots != 2) && (slots != 4) && (slots != 8) && (slots != 16)) {
+            mp_raise_ValueError(MP_ERROR_TEXT("invalid slots"));
+        }
+        i2s_num_slots = (uint8_t)slots;
     }
 
     // is Rate valid?
@@ -660,6 +705,7 @@ static void mp_machine_i2s_init_helper(machine_i2s_obj_t *self, mp_arg_val_t *ar
     self->mode = i2s_mode;
     self->bits = i2s_bits;
     self->format = i2s_format;
+    self->num_slots = i2s_num_slots;
     self->rate = i2s_rate;
     self->ibuf = ring_buffer_len;
     self->callback_for_non_blocking = MP_OBJ_NULL;

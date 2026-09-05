@@ -67,9 +67,34 @@
 #define NUM_I2S_USER_FORMATS (4)
 #define I2S_RX_FRAME_SIZE_IN_BYTES (8)
 
+// TDM needs a per-object slot count (machine_i2s_obj_t.num_slots) that only ports
+// opting in via MICROPY_PY_MACHINE_I2S_TDM actually have -- referencing self->num_slots
+// unconditionally here would fail to compile on every other port. i2s_num_slots(self)
+// is the guarded accessor, used only inside `self->format == TDM` branches; ports
+// without support never reach those branches in practice, since the I2S.TDM constant
+// itself is only exposed when MICROPY_PY_MACHINE_I2S_TDM is set (see
+// machine_i2s_locals_dict_table below), so user code on those ports has no supported
+// way to construct an object with format==TDM in the first place.
+#ifndef MICROPY_PY_MACHINE_I2S_TDM
+#define MICROPY_PY_MACHINE_I2S_TDM (0)
+#endif
+
+#if MICROPY_PY_MACHINE_I2S_TDM
+#define i2s_num_slots(self) ((self)->num_slots)
+#else
+#define i2s_num_slots(self) (0)
+#endif
+
 typedef enum {
     MONO,
-    STEREO
+    STEREO,
+    // A generic N-slot TDM format, N given by the `slots` constructor argument
+    // (ARG_slots below). Unlike MONO/STEREO, TDM does no channel duplication or
+    // byte-remapping: the caller's buffer must already be correctly slot-interleaved.
+    // Currently only implemented by the mimxrt port (see ports/mimxrt/machine_i2s.c,
+    // MICROPY_PY_MACHINE_I2S_TDM); the I2S.TDM constant below is only exposed by ports
+    // that define that macro, so other ports have no way to select this value.
+    TDM,
 } format_t;
 
 typedef enum {
@@ -91,6 +116,10 @@ enum {
     ARG_format,
     ARG_rate,
     ARG_ibuf,
+    #if MICROPY_PY_MACHINE_I2S_TDM
+    // TDM slot count, meaningful only when format=TDM -- see the format_t enum above.
+    ARG_slots,
+    #endif
 };
 
 #if MICROPY_PY_MACHINE_I2S_RING_BUF
@@ -194,6 +223,38 @@ static uint32_t fill_appbuf_from_ringbuf(machine_i2s_obj_t *self, mp_buffer_info
     //   Thus, for every 1 byte copied to the app buffer, 4 bytes are read from the ring buffer.
     //   If a 8kB app buffer is supplied, 32kB of audio samples is read from the ring buffer.
 
+    // TDM: I2S_RX_FRAME_SIZE_IN_BYTES is a fixed compile-time constant (8 = 2 channels x
+    // 4 bytes) baked into i2s_frame_map's table dimensions -- it does not scale to TDM's
+    // runtime-variable slot count (2/4/8/16). Rather than force TDM through that
+    // table-driven MONO/STEREO remapping machinery, it gets its own simple,
+    // self-contained raw-passthrough path here: always 32-bit words, one ringbuf_pop()
+    // per byte, no cherry-picking/duplication -- the caller's appbuf is expected to
+    // already be laid out as consecutive slot0, slot1, ..., slotN-1 32-bit words per
+    // frame, exactly what the DMA buffer already contains. This does not touch the
+    // MONO/STEREO code path below at all.
+    if (self->format == TDM) {
+        uint32_t num_bytes_needed_from_ringbuf = appbuf->len;
+        uint32_t num_bytes_copied_to_appbuf = 0;
+        uint8_t *app_p = (uint8_t *)appbuf->buf;
+        while (num_bytes_needed_from_ringbuf) {
+            if (self->io_mode == BLOCKING) {
+                while (ringbuf_pop(&self->ring_buffer, app_p) == false) {
+                    ;
+                }
+            } else if (self->io_mode == ASYNCIO) {
+                if (ringbuf_pop(&self->ring_buffer, app_p) == false) {
+                    break; // ring buffer is empty, exit
+                }
+            } else {
+                return 0; // should never get here (non-blocking mode does not use this function)
+            }
+            app_p++;
+            num_bytes_copied_to_appbuf++;
+            num_bytes_needed_from_ringbuf--;
+        }
+        return num_bytes_copied_to_appbuf;
+    }
+
     uint32_t num_bytes_copied_to_appbuf = 0;
     uint8_t *app_p = (uint8_t *)appbuf->buf;
     uint8_t appbuf_sample_size_in_bytes = (self->bits == 16? 2 : 4) * (self->format == STEREO ? 2: 1);
@@ -255,29 +316,44 @@ static void fill_appbuf_from_ringbuf_non_blocking(machine_i2s_obj_t *self) {
     uint32_t num_bytes_copied_to_appbuf = 0;
     uint8_t *app_p = &(((uint8_t *)self->non_blocking_descriptor.appbuf.buf)[self->non_blocking_descriptor.index]);
 
-    uint8_t appbuf_sample_size_in_bytes = (self->bits == 16? 2 : 4) * (self->format == STEREO ? 2: 1);
+    // TDM: see fill_appbuf_from_ringbuf()'s own comment for why TDM can't use
+    // I2S_RX_FRAME_SIZE_IN_BYTES/i2s_frame_map. Same approach here: TDM's "sample size"
+    // is just num_slots 32-bit words, 1:1 raw copy, no discard bytes.
+    uint8_t appbuf_sample_size_in_bytes = (self->format == TDM)
+        ? (i2s_num_slots(self) * 4)
+        : (self->bits == 16? 2 : 4) * (self->format == STEREO ? 2: 1);
     uint32_t num_bytes_remaining_to_copy_to_appbuf = self->non_blocking_descriptor.appbuf.len - self->non_blocking_descriptor.index;
-    uint32_t num_bytes_remaining_to_copy_from_ring_buffer = num_bytes_remaining_to_copy_to_appbuf *
-        (I2S_RX_FRAME_SIZE_IN_BYTES / appbuf_sample_size_in_bytes);
+    uint32_t num_bytes_remaining_to_copy_from_ring_buffer = (self->format == TDM)
+        ? num_bytes_remaining_to_copy_to_appbuf
+        : num_bytes_remaining_to_copy_to_appbuf * (I2S_RX_FRAME_SIZE_IN_BYTES / appbuf_sample_size_in_bytes);
     uint32_t num_bytes_needed_from_ringbuf = MIN(SIZEOF_NON_BLOCKING_COPY_IN_BYTES, num_bytes_remaining_to_copy_from_ring_buffer);
     uint8_t discard_byte;
     if (ringbuf_available_data(&self->ring_buffer) >= num_bytes_needed_from_ringbuf) {
-        while (num_bytes_needed_from_ringbuf) {
-
-            uint8_t f_index = get_frame_mapping_index(self->bits, self->format);
-
-            for (uint8_t i = 0; i < I2S_RX_FRAME_SIZE_IN_BYTES; i++) {
-                int8_t r_to_a_mapping = i2s_frame_map[f_index][i];
-                if (r_to_a_mapping != -1) {
-                    ringbuf_pop(&self->ring_buffer, app_p + r_to_a_mapping);
-                    num_bytes_copied_to_appbuf++;
-                } else { // r_a_mapping == -1
-                    // discard unused byte from ring buffer
-                    ringbuf_pop(&self->ring_buffer, &discard_byte);
-                }
+        if (self->format == TDM) {
+            while (num_bytes_needed_from_ringbuf) {
+                ringbuf_pop(&self->ring_buffer, app_p);
+                app_p++;
+                num_bytes_copied_to_appbuf++;
                 num_bytes_needed_from_ringbuf--;
             }
-            app_p += appbuf_sample_size_in_bytes;
+        } else {
+            while (num_bytes_needed_from_ringbuf) {
+
+                uint8_t f_index = get_frame_mapping_index(self->bits, self->format);
+
+                for (uint8_t i = 0; i < I2S_RX_FRAME_SIZE_IN_BYTES; i++) {
+                    int8_t r_to_a_mapping = i2s_frame_map[f_index][i];
+                    if (r_to_a_mapping != -1) {
+                        ringbuf_pop(&self->ring_buffer, app_p + r_to_a_mapping);
+                        num_bytes_copied_to_appbuf++;
+                    } else { // r_a_mapping == -1
+                        // discard unused byte from ring buffer
+                        ringbuf_pop(&self->ring_buffer, &discard_byte);
+                    }
+                    num_bytes_needed_from_ringbuf--;
+                }
+                app_p += appbuf_sample_size_in_bytes;
+            }
         }
         self->non_blocking_descriptor.index += num_bytes_copied_to_appbuf;
 
@@ -354,6 +430,12 @@ MP_NOINLINE static void machine_i2s_init_helper(machine_i2s_obj_t *self, size_t 
         { MP_QSTR_format,   MP_ARG_KW_ONLY | MP_ARG_REQUIRED | MP_ARG_INT,   {.u_int = -1} },
         { MP_QSTR_rate,     MP_ARG_KW_ONLY | MP_ARG_REQUIRED | MP_ARG_INT,   {.u_int = -1} },
         { MP_QSTR_ibuf,     MP_ARG_KW_ONLY | MP_ARG_REQUIRED | MP_ARG_INT,   {.u_int = -1} },
+        #if MICROPY_PY_MACHINE_I2S_TDM
+        // Optional, only required when format=TDM (validated in the port's
+        // mp_machine_i2s_init_helper(), not here, since -1/absent is the correct
+        // default for MONO/STEREO).
+        { MP_QSTR_slots,    MP_ARG_KW_ONLY | MP_ARG_INT,   {.u_int = -1} },
+        #endif
     };
 
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
@@ -519,6 +601,10 @@ static const mp_rom_map_elem_t machine_i2s_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_TX),              MP_ROM_INT(MICROPY_PY_MACHINE_I2S_CONSTANT_TX) },
     { MP_ROM_QSTR(MP_QSTR_STEREO),          MP_ROM_INT(STEREO) },
     { MP_ROM_QSTR(MP_QSTR_MONO),            MP_ROM_INT(MONO) },
+    #if MICROPY_PY_MACHINE_I2S_TDM
+    // See the format_t enum above: currently only implemented by the mimxrt port.
+    { MP_ROM_QSTR(MP_QSTR_TDM),             MP_ROM_INT(TDM) },
+    #endif
 };
 MP_DEFINE_CONST_DICT(machine_i2s_locals_dict, machine_i2s_locals_dict_table);
 
@@ -530,7 +616,10 @@ static mp_uint_t machine_i2s_stream_read(mp_obj_t self_in, void *buf_in, mp_uint
         return MP_STREAM_ERROR;
     }
 
-    uint8_t appbuf_sample_size_in_bytes = (self->bits / 8) * (self->format == STEREO ? 2: 1);
+    // TDM: see fill_appbuf_from_ringbuf()'s own comment.
+    uint8_t appbuf_sample_size_in_bytes = (self->format == TDM)
+        ? (i2s_num_slots(self) * 4)
+        : (self->bits / 8) * (self->format == STEREO ? 2: 1);
     if (size % appbuf_sample_size_in_bytes != 0) {
         *errcode = MP_EINVAL;
         return MP_STREAM_ERROR;
