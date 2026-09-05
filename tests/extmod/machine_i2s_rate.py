@@ -23,7 +23,7 @@ elif "rp2" in sys.platform:
 elif "mimxrt" in sys.platform:
     i2s_instances = (
         (1, Pin("D26"), Pin("D27"), Pin("D7"), Pin("D8")),
-        (2, Pin("D4"), Pin("D3"), Pin("D2"), None),
+        (2, Pin("D4"), Pin("D3"), Pin("D2"), Pin("D5")),
     )
 elif "esp32" in sys.platform:
     if "ESP32-C3" in sys.implementation._machine:
