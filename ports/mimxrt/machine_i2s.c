@@ -200,7 +200,16 @@ static const i2s_clock_config_t clock_config_map[] = {
     {kSAI_SampleRate24KHz, &audioPllConfig_8000_48000, 1, 63},     // 128
     {kSAI_SampleRate32KHz, &audioPllConfig_8000_48000, 1, 47},     // 96
     {kSAI_SampleRate44100Hz, &audioPllConfig_11025_44100, 0, 63},  // 64
-    {kSAI_SampleRate48KHz, &audioPllConfig_8000_48000, 0, 63}      // 64
+    {kSAI_SampleRate48KHz, &audioPllConfig_8000_48000, 0, 63},     // 64
+    // 96kHz and 192kHz reuse audioPllConfig_8000_48000: its fixed PLL output
+    // (786,432,000 Hz = 48000 x 64 x 256, see that config's own comment above) divides
+    // evenly for these too, since they are clean binary multiples of the 48kHz family.
+    // Total division factor = PLL output / (256 x rate): 32 for 96kHz, 16 for 192kHz,
+    // both reachable with pre_div=0 given the (pre_div+1)*(div+1) formula this table
+    // already uses (confirmed against the 48kHz/32kHz entries' own division-factor
+    // comments).
+    {kSAI_SampleRate96KHz, &audioPllConfig_8000_48000, 0, 31},     // 32
+    {kSAI_SampleRate192KHz, &audioPllConfig_8000_48000, 0, 15}     // 16
 };
 
 static const clock_mux_t i2s_clock_mux[] = I2S_CLOCK_MUX;
