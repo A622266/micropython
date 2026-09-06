@@ -545,7 +545,17 @@ static mp_obj_t machine_spi_dma_periodic_start(size_t n_args, const mp_obj_t *ar
     // guarantees a specific relative phase). This is the single biggest unproven piece
     // of this patch -- do not trust I/O_UPDATE timing without an ADALM2000 capture.
     if (io_update_duty_u16 > 0) {
+        // Bench-found bug (2026-09-06): IOMUXC_SetPinMux() alone was not followed by an
+        // IOMUXC_SetPinConfig() call, unlike every other pin-mux site in this file
+        // (lpspi_set_iomux() always pairs the two) -- the pad's electrical config was
+        // left at whatever reset default it had, and a digital capture confirmed
+        // I/O_UPDATE never toggled at all (0 rising edges across a 1ms/~190-frame
+        // window) despite SPI itself clocking out real, correctly-framed data. Fixed by
+        // adding the missing SetPinConfig call, mirroring lpspi_set_iomux()'s own
+        // pattern exactly (PIN_MODE_OUT, same pull/drive choice).
         IOMUXC_SetPinMux(IOMUXC_GPIO_AD_B1_03_QTIMER3_TIMER3, 0U);
+        IOMUXC_SetPinConfig(IOMUXC_GPIO_AD_B1_03_QTIMER3_TIMER3,
+            pin_generate_config(PIN_PULL_UP_100K, PIN_MODE_OUT, DEFAULT_SPI_DRIVE, 0x401F82F8U));
         uint16_t io_update_ticks;
         int prescale = spi_dma_calc_qtmr_prescale(ipg_clk_hz, (uint32_t)rate_hz, &io_update_ticks);
         if (prescale < 0) {
