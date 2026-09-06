@@ -39,6 +39,8 @@
 #include "fsl_lpspi.h"
 #include "fsl_lpspi_edma.h"
 #include "fsl_qtmr.h"
+#include "fsl_pit.h"
+#include "fsl_xbara.h"
 #include "dma_manager.h"
 #include "hal/pwm_backport.h"  // QTMR_SetupPwm_u16 -- a project-local backport, not stock SDK
 
@@ -57,26 +59,35 @@
 // not assumed:
 //   - PIT and GPT have NO entry in the dma_request_source_t enum
 //     (sdk/devices/MIMXRT1062/MIMXRT1062.h) -- neither can trigger DMAMUX directly.
-//   - Quad Timer (QTMR/TMR) modules DO have dedicated DMAMUX request-source entries for
-//     their comparator-preload/reload ("Cmpld") events, e.g.
-//     kDmaRequestMuxQTIMER2Cmpld1Timer0Cmpld2Timer1 for TMR2 channel 0.
-//   - QTMR_EnableDma()/kQTMR_ComparatorPreload1DmaEnable (sdk/drivers/qtmr_1/fsl_qtmr.h)
-//     arms that DMA request on a QTMR channel's period-reload event.
-//   - QTMR_SetTimerPeriod()'s own doc comment: "writes to COMP1 or COMP2 depending on
-//     count direction" -- an up-counting channel (this project's free-running,
-//     kQTMR_PriSrcRiseEdge-off-an-internal-clock configuration, the same recipe
-//     machine_pwm.c already uses for TMR-backed PWM objects) writes/compares against
-//     COMP1, hence Preload1 (not Preload2) is the correct DMA-enable bit here.
+//   - An EARLIER version of this file used Quad Timer (QTMR2)'s "Comparator Preload"
+//     DMA request for the trigger. Bench-tested 2026-09-06 and found NOT to work: that
+//     mechanism is tied to the CMPLD1->COMP1 double-buffered reload feature (a
+//     producer/consumer relationship for auto-refreshing a compare value via DMA), not a
+//     bare "period elapsed" pulse -- confirmed via a dedicated ISR-count diagnostic
+//     (spi_dma_isr_count(), kept in this file -- see dma_periodic_isr_count() below)
+//     showing zero interrupts over a 30s run despite the DDS output looking stable (that
+//     stability was just the initial blocking-write priming value, latched and held by
+//     the chip, never actually refreshed by DMA). Use the same counter to confirm PIT's
+//     interrupt actually reaches this callback before trusting this replacement either.
+//   - Replaced with PIT + XBARA1. PIT_StartTimer()'s own doc comment
+//     (sdk/drivers/pit/fsl_pit.h) says a channel "generates a trigger pulse" every time
+//     it reaches 0, unconditionally -- no compare/capture/reload complexity, this is
+//     PIT's entire purpose. That trigger has no direct DMAMUX entry, but XBARA1 has a
+//     dedicated input for it (kXBARA1_InputPitTrigger0, MIMXRT1062.h) routable to one of
+//     XBARA1's 4 DMAMUX-facing outputs (kXBARA1_OutputDmaChMuxReq30, confirmed to be the
+//     same physical signal as DMAMUX's own kDmaRequestMuxXBAR1Request0 by cross-
+//     referencing the request number in both enums' comments).
 //   - Pin D15 (SoC pad GPIO_AD_B1_03, this project's I/O_UPDATE pin per prior bring-up)
 //     has a native alternate-function mux to QTIMER3_TIMER3
 //     (IOMUXC_GPIO_AD_B1_03_QTIMER3_TIMER3, sdk/devices/MIMXRT1062/drivers/fsl_iomuxc.h)
 //     -- so TMR3 channel 3, run as an ordinary hardware PWM exactly like
 //     machine_pwm.c's QTMR_SetupPwm_u16() path, can generate the I/O_UPDATE latch pulse
-//     with zero CPU/DMA involvement, no GPIO-toggle-via-DMA hack needed.
+//     with zero CPU/DMA involvement, no GPIO-toggle-via-DMA hack needed. This part is
+//     unrelated to the PIT/QTMR2 trigger-mechanism question and unchanged by that swap.
 //   - LPSPI's own automatic FIFO-empty DMA request (its DER register) is deliberately
 //     NOT used or enabled anywhere in this file -- it would be paced by the SPI baud
-//     rate, not by the QTMR-sourced 192kHz trigger, and the two must not both drive the
-//     same DMAMUX channel. Writes to TDR here happen unconditionally at the QTMR's pace;
+//     rate, not by the PIT-sourced 192kHz trigger, and the two must not both drive the
+//     same DMAMUX channel. Writes to TDR here happen unconditionally at the PIT's pace;
 //     the caller is responsible for choosing a baudrate high enough that one frame's
 //     clock-out time stays comfortably under one rate_hz period (e.g. an 8-byte AD9910
 //     Profile 0 write is 64 bits; at 192kHz that leaves ~5.2us, so a >=20Mbps baudrate
@@ -85,17 +96,19 @@
 //
 // NOT yet verified -- real open items, deliberately left as runtime-computed or
 // explicit caller-supplied values rather than guessed constants:
-//   - The exact QTMR2 channel-0 tick count for a given rate_hz: computed at
-//     spi_dma_periodic_start() time from CLOCK_GetFreq(kCLOCK_IpgClk), mirroring
-//     machine_pwm.c's configure_qtmr()/calc_prescaler() exactly, not hardcoded.
+//   - The exact PIT channel-0 tick count for a given rate_hz: computed at
+//     spi_dma_periodic_start() time from CLOCK_GetPerClkFreq(), the accessor this SDK
+//     provides specifically for PIT's own clock root, not hardcoded. NOT yet bench-
+//     confirmed that PIT's trigger actually reaches the eDMA channel end to end (that's
+//     the immediate next thing to verify, after QTMR2's mechanism turned out not to).
 //   - I/O_UPDATE pulse width/phase relative to the SPI frame's completion -- exposed as
 //     explicit io_update_duty_u16/io_update_phase_ticks arguments rather than a default,
 //     because getting this wrong either misses the datasheet's I/O_UPDATE setup/hold
 //     window or clips into the next frame; needs ADALM2000 bench measurement.
-//   - Whether TMR2 channel 0 and TMR3 channel 3 are free at runtime on top of whatever
-//     else the running firmware claims (this file does not check for conflicts with
-//     machine.PWM objects a user script may have already created on those same
-//     channels -- a real gap, not yet handled).
+//   - Whether PIT channel 0, XBARA1 output 0, and TMR3 channel 3 are free at runtime on
+//     top of whatever else the running firmware claims (this file does not check for
+//     conflicts with e.g. a machine.PWM object a user script may have already created on
+//     TMR3 channel 3 -- a real gap, not yet handled).
 //   - D-cache coherency around the ring buffer (RESOLVED 2026-09-06): a frequency-sweep
 //     bench test found this exact gap for real -- dma_periodic_write() calls succeeded
 //     and produced genuinely varying content (confirmed via the Teensy's own debug log),
@@ -141,9 +154,29 @@
 // (the DDS phase path), so no per-instance allocation is implemented. TMR3 channel 3 is
 // dedicated as the I/O_UPDATE pulse generator, chosen because it's the only TMR channel
 // with a native mux to pin D15 (see the module-level comment above).
-#define SPI_DMA_TMR_BASE            TMR2
-#define SPI_DMA_TMR_CHANNEL         kQTMR_Channel_0
-#define SPI_DMA_TMR_DMAMUX_SRC      kDmaRequestMuxQTIMER2Cmpld1Timer0Cmpld2Timer1
+// Trigger mechanism (2026-09-06, revised): NOT QTMR2 anymore -- bench-tested and found
+// that QTMR's "Comparator Preload" DMA request is tied to the CMPLD1->COMP1 double-
+// buffered reload mechanism (a producer/consumer relationship for auto-updating a
+// compare value via DMA), not a bare "period elapsed" pulse; nothing ever primed
+// CMPLD1, so the request never fired (confirmed via a dedicated ISR-count diagnostic:
+// zero interrupts over a 30s run despite the DDS output looking stable -- that stability
+// was just the initial blocking-write priming value, latched and held, never actually
+// refreshed by DMA).
+//
+// Replaced with PIT + XBARA1, verified against the device header (not assumed):
+// PIT_StartTimer()'s own doc says a channel "generates a trigger pulse" unconditionally
+// every time it reaches 0 -- no compare/capture/reload complexity attached, this is
+// PIT's entire purpose. That trigger has no direct DMAMUX entry (confirmed earlier --
+// PIT and GPT are both absent from dma_request_source_t), but XBARA1 has a dedicated
+// input for it (kXBARA1_InputPitTrigger0, MIMXRT1062.h) which can be routed to one of
+// XBARA1's 4 DMAMUX-facing outputs (kXBARA1_OutputDmaChMuxReq30, matching DMAMUX's own
+// kDmaRequestMuxXBAR1Request0 -- confirmed these are the same physical signal by cross-
+// referencing the request-number in both enums' comments). PIT channel 0, XBARA1 output
+// 0 chosen; nothing else in this codebase uses either.
+#define SPI_DMA_PIT_CHANNEL         kPIT_Chnl_0
+#define SPI_DMA_XBAR_INPUT          kXBARA1_InputPitTrigger0
+#define SPI_DMA_XBAR_OUTPUT         kXBARA1_OutputDmaChMuxReq30
+#define SPI_DMA_DMAMUX_SRC          kDmaRequestMuxXBAR1Request0
 #define SPI_DMA_IO_UPDATE_TMR_BASE  TMR3
 #define SPI_DMA_IO_UPDATE_CHANNEL   kQTMR_Channel_3
 
@@ -385,12 +418,20 @@ static const mp_machine_spi_p_t machine_spi_p = {
 // hardware facts this depends on, and what's still open.
 
 // TCD storage for the periodic-DMA channel. Only one SPI(id) can run dma_periodic_start()
-// at a time in this implementation (see SPI_DMA_TMR_BASE's own comment), so a single
+// at a time in this implementation (see SPI_DMA_PIT_CHANNEL's own comment), so a single
 // static TCD suffices -- mirrors machine_i2s.c's AT_NONCACHEABLE_SECTION_ALIGN(edma_tcd_t
 // edmaTcd[I2S_NUM_OBJ_SLOTS], 32) pattern, sized 1 instead of I2S_NUM_OBJ_SLOTS.
 AT_NONCACHEABLE_SECTION_ALIGN(static edma_tcd_t spi_dma_tcd, 32);
 
+// Diagnostic-only counter (2026-09-06): increments unconditionally, at ISR level, every
+// time this callback runs at all -- independent of whether mp_sched_schedule() actually
+// gets serviced by the Python side. Used to separate "the eDMA interrupt never fires" from
+// "it fires but the scheduled Python callback never runs" after a sweep test found
+// refill() only ever called twice (the initial manual primes) in a 30s run.
+volatile uint32_t spi_dma_isr_count = 0;
+
 static void edma_spi_periodic_callback(edma_handle_t *handle, void *userData, bool transferDone, uint32_t tcds) {
+    spi_dma_isr_count++;
     machine_spi_obj_t *self = (machine_spi_obj_t *)userData;
     if (self->dma_refill_callback != MP_OBJ_NULL && self->dma_refill_callback != mp_const_none) {
         // transferDone == true means the eDMA major loop just wrapped, i.e. the bottom
@@ -473,30 +514,43 @@ static mp_obj_t machine_spi_dma_periodic_start(size_t n_args, const mp_obj_t *ar
 
     self->dma_refill_callback = refill_callback;
 
-    // --- QTMR2 channel 0: free-running internal-clock periodic trigger, no pin output.
-    // Identical setup recipe to machine_pwm.c's configure_qtmr(), minus QTMR_SetupPwm().
     uint32_t ipg_clk_hz = CLOCK_GetFreq(kCLOCK_IpgClk);
-    uint16_t trigger_ticks;
-    int prescale = spi_dma_calc_qtmr_prescale(ipg_clk_hz, (uint32_t)rate_hz, &trigger_ticks);
-    if (prescale < 0) {
-        mp_raise_ValueError(MP_ERROR_TEXT("rate_hz too low to represent"));
-    }
-    qtmr_config_t trigger_config;
-    QTMR_GetDefaultConfig(&trigger_config);
-    trigger_config.primarySource = (qtmr_primary_count_source_t)(prescale + kQTMR_ClockDivide_1);
-    QTMR_Init(SPI_DMA_TMR_BASE, SPI_DMA_TMR_CHANNEL, &trigger_config);
-    QTMR_SetTimerPeriod(SPI_DMA_TMR_BASE, SPI_DMA_TMR_CHANNEL, trigger_ticks);
-    QTMR_EnableDma(SPI_DMA_TMR_BASE, SPI_DMA_TMR_CHANNEL, kQTMR_ComparatorPreload1DmaEnable);
 
-    // --- TMR3 channel 3 / pin D15: I/O_UPDATE pulse, ordinary hardware PWM.
+    // --- PIT channel 0: unconditional periodic trigger pulse, routed via XBARA1 into
+    // DMAMUX. See SPI_DMA_PIT_CHANNEL's own comment above for why this replaced QTMR2.
+    pit_config_t pit_config;
+    PIT_GetDefaultConfig(&pit_config);
+    PIT_Init(PIT, &pit_config);
+    uint32_t perclk_hz = CLOCK_GetPerClkFreq();
+    uint32_t pit_ticks = perclk_hz / (uint32_t)rate_hz;
+    if (pit_ticks == 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("rate_hz too high to represent on PIT"));
+    }
+    PIT_SetTimerPeriod(PIT, SPI_DMA_PIT_CHANNEL, pit_ticks);
+
+    XBARA_Init(XBARA1);
+    XBARA_SetSignalsConnection(XBARA1, SPI_DMA_XBAR_INPUT, SPI_DMA_XBAR_OUTPUT);
+    xbara_control_config_t xbar_ctrl_config = {
+        .activeEdge = kXBARA_EdgeRising,
+        .requestType = kXBARA_RequestDMAEnable,
+    };
+    XBARA_SetOutputSignalConfig(XBARA1, SPI_DMA_XBAR_OUTPUT, &xbar_ctrl_config);
+
+    // --- TMR3 channel 3 / pin D15: I/O_UPDATE pulse, ordinary hardware PWM. Still QTMR-
+    // based -- this part is unrelated to the trigger-mechanism swap above and unchanged.
     // TODO(bench): io_update_duty_u16/io_update_phase_ticks are passed through
     // uninterpreted below beyond what QTMR_SetupPwm_u16 itself does with a duty value --
-    // the phase relationship to the SPI-triggering TMR2 channel is NOT yet established
-    // by this code (both channels are simply started independently below; nothing here
+    // the phase relationship to the SPI-triggering PIT channel is NOT yet established
+    // by this code (PIT and TMR3 are simply started independently below; nothing here
     // guarantees a specific relative phase). This is the single biggest unproven piece
     // of this patch -- do not trust I/O_UPDATE timing without an ADALM2000 capture.
     if (io_update_duty_u16 > 0) {
         IOMUXC_SetPinMux(IOMUXC_GPIO_AD_B1_03_QTIMER3_TIMER3, 0U);
+        uint16_t io_update_ticks;
+        int prescale = spi_dma_calc_qtmr_prescale(ipg_clk_hz, (uint32_t)rate_hz, &io_update_ticks);
+        if (prescale < 0) {
+            mp_raise_ValueError(MP_ERROR_TEXT("rate_hz too low to represent"));
+        }
         qtmr_config_t io_update_config;
         QTMR_GetDefaultConfig(&io_update_config);
         io_update_config.primarySource = (qtmr_primary_count_source_t)(prescale + kQTMR_ClockDivide_1);
@@ -542,7 +596,7 @@ static mp_obj_t machine_spi_dma_periodic_start(size_t n_args, const mp_obj_t *ar
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("no DMA channel available"));
     }
     DMAMUX_Init(DMAMUX);
-    DMAMUX_SetSource(DMAMUX, self->dma_channel, SPI_DMA_TMR_DMAMUX_SRC);
+    DMAMUX_SetSource(DMAMUX, self->dma_channel, SPI_DMA_DMAMUX_SRC);
     DMAMUX_EnableChannel(DMAMUX, self->dma_channel);
 
     // Idempotent (guarded internally) -- must still be called here rather than assumed
@@ -573,7 +627,7 @@ static mp_obj_t machine_spi_dma_periodic_start(size_t n_args, const mp_obj_t *ar
     EDMA_InstallTCD(DMA0, self->dma_channel, self->dma_edmaTcd);
     EDMA_StartTransfer(&self->dma_edmaHandle);
 
-    QTMR_StartTimer(SPI_DMA_TMR_BASE, SPI_DMA_TMR_CHANNEL, kQTMR_PriSrcRiseEdge);
+    PIT_StartTimer(PIT, SPI_DMA_PIT_CHANNEL);
 
     self->dma_periodic_active = true;
     return mp_const_none;
@@ -606,6 +660,13 @@ static mp_obj_t machine_spi_dma_periodic_write(mp_obj_t self_in, mp_obj_t half_i
 }
 static MP_DEFINE_CONST_FUN_OBJ_3(machine_spi_dma_periodic_write_obj, machine_spi_dma_periodic_write);
 
+// Diagnostic-only (2026-09-06): see spi_dma_isr_count's own comment above.
+static mp_obj_t machine_spi_dma_periodic_isr_count(mp_obj_t self_in) {
+    (void)self_in;
+    return mp_obj_new_int_from_uint(spi_dma_isr_count);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(machine_spi_dma_periodic_isr_count_obj, machine_spi_dma_periodic_isr_count);
+
 static mp_obj_t machine_spi_dma_periodic_stop(mp_obj_t self_in) {
     machine_spi_obj_t *self = MP_OBJ_TO_PTR(self_in);
     if (!self->dma_periodic_active) {
@@ -613,7 +674,7 @@ static mp_obj_t machine_spi_dma_periodic_stop(mp_obj_t self_in) {
     }
     EDMA_AbortTransfer(&self->dma_edmaHandle);
     free_dma_channel(self->dma_channel);
-    QTMR_StopTimer(SPI_DMA_TMR_BASE, SPI_DMA_TMR_CHANNEL);
+    PIT_StopTimer(PIT, SPI_DMA_PIT_CHANNEL);
     QTMR_StopTimer(SPI_DMA_IO_UPDATE_TMR_BASE, SPI_DMA_IO_UPDATE_CHANNEL);
     self->dma_periodic_active = false;
     self->dma_refill_callback = MP_OBJ_NULL;
@@ -656,6 +717,7 @@ static const mp_rom_map_elem_t machine_spi_mimxrt_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_dma_periodic_start), MP_ROM_PTR(&machine_spi_dma_periodic_start_obj) },
     { MP_ROM_QSTR(MP_QSTR_dma_periodic_write), MP_ROM_PTR(&machine_spi_dma_periodic_write_obj) },
     { MP_ROM_QSTR(MP_QSTR_dma_periodic_stop), MP_ROM_PTR(&machine_spi_dma_periodic_stop_obj) },
+    { MP_ROM_QSTR(MP_QSTR_dma_periodic_isr_count), MP_ROM_PTR(&machine_spi_dma_periodic_isr_count_obj) },
 };
 MP_DEFINE_CONST_DICT(mp_machine_spi_mimxrt_locals_dict, machine_spi_mimxrt_locals_dict_table);
 
