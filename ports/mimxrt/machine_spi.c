@@ -96,6 +96,13 @@
 //     else the running firmware claims (this file does not check for conflicts with
 //     machine.PWM objects a user script may have already created on those same
 //     channels -- a real gap, not yet handled).
+//   - D-cache coherency around the ring buffer (RESOLVED 2026-09-06): a frequency-sweep
+//     bench test found this exact gap for real -- dma_periodic_write() calls succeeded
+//     and produced genuinely varying content (confirmed via the Teensy's own debug log),
+//     but the DDS output never changed, stuck on whatever the first write left in RAM.
+//     Fixed by adding DCACHE_CleanByRange() after both the initial memset() in
+//     dma_periodic_start() and every memcpy() in dma_periodic_write(). Re-verify the
+//     sweep test again with this fix before considering it fully closed.
 //   - Multi-byte frame bit-ordering on the wire, end to end. dma_periodic_start() widens
 //     LPSPI's TCR.FRAMESZ so hardware holds chip-select low across a whole
 //     instruction-byte+payload frame instead of toggling it every byte (see that
@@ -453,14 +460,16 @@ static mp_obj_t machine_spi_dma_periodic_start(size_t n_args, const mp_obj_t *ar
     // AT_NONCACHEABLE_SECTION_ALIGN is not used here because size is only known at this
     // point (frame_bytes is caller-specified), unlike the fixed-size TCD above -- this
     // buffer instead needs an explicit cache-maintenance call before each DMA-visible
-    // write. TODO(bench): this implementation does NOT yet call DCACHE_CleanByRange()
-    // anywhere -- machine_i2s.c's own dma_buffer apparently avoids needing this via
-    // linker placement, not a runtime call (see this file's module comment); this heap-
-    // allocated buffer has NOT been confirmed to get the same treatment and may need an
-    // explicit clean call added in dma_periodic_write() below before it can be trusted.
+    // write -- confirmed necessary by bench test (2026-09-06): a frequency-sweep test
+    // wrote genuinely changing content via dma_periodic_write() on every refill (verified
+    // via the Teensy's own debug log), but the DDS output never changed, stuck at
+    // whatever the very first write happened to leave in RAM -- exactly the D-cache
+    // staleness this TODO predicted (CPU writes land in cache, DMA reads RAM directly,
+    // never sees the update without an explicit clean).
     self->dma_buffer = m_new(uint8_t, total_bytes + 0x1f);
     self->dma_buffer_dcache_aligned = (uint8_t *)(((uint32_t)self->dma_buffer + 0x1f) & ~0x1f);
     memset(self->dma_buffer_dcache_aligned, 0, total_bytes);
+    DCACHE_CleanByRange((uint32_t)self->dma_buffer_dcache_aligned, (uint32_t)total_bytes);
 
     self->dma_refill_callback = refill_callback;
 
@@ -589,9 +598,10 @@ static mp_obj_t machine_spi_dma_periodic_write(mp_obj_t self_in, mp_obj_t half_i
     }
     uint8_t *dest = self->dma_buffer_dcache_aligned + (half ? half_bytes : 0);
     memcpy(dest, buf.buf, half_bytes);
-    // TODO(bench): no DCACHE_CleanByRange() call here -- see the "not yet call..." TODO
-    // in dma_periodic_start() above. If DMA reads stale data, this is the first place to
-    // add one.
+    // Confirmed necessary by bench test (2026-09-06) -- see dma_periodic_start()'s own
+    // comment. Without this, DMA silently keeps reading whatever stale content was in
+    // RAM before this call, ignoring every refill.
+    DCACHE_CleanByRange((uint32_t)dest, (uint32_t)half_bytes);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_3(machine_spi_dma_periodic_write_obj, machine_spi_dma_periodic_write);
