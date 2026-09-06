@@ -42,7 +42,13 @@ static mp_obj_t machine_spi_init(size_t n_args, const mp_obj_t *args, mp_map_t *
     spi_p->init(s, n_args - 1, args + 1, kw_args);
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_KW(machine_spi_init_obj, 1, machine_spi_init);
+// Linkage note (2026-09, mimxrt SPI periodic-DMA patch): dropped `static` from this and
+// machine_spi_deinit_obj below so ports/mimxrt/machine_spi.c can build its own extended
+// locals dict (adding dma_periodic_start/write/stop) that still includes these two
+// generic entries, rather than duplicating their bodies. No behavior change -- same
+// precedent as this project's earlier I2S TDM patch touching a shared extmod file when
+// a port-local file genuinely couldn't carry the addition alone.
+MP_DEFINE_CONST_FUN_OBJ_KW(machine_spi_init_obj, 1, machine_spi_init);
 
 static mp_obj_t machine_spi_deinit(mp_obj_t self) {
     mp_obj_base_t *s = (mp_obj_base_t *)MP_OBJ_TO_PTR(self);
@@ -52,7 +58,7 @@ static mp_obj_t machine_spi_deinit(mp_obj_t self) {
     }
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_1(machine_spi_deinit_obj, machine_spi_deinit);
+MP_DEFINE_CONST_FUN_OBJ_1(machine_spi_deinit_obj, machine_spi_deinit);
 
 static void mp_machine_spi_transfer(mp_obj_t self, size_t len, const void *src, void *dest) {
     mp_obj_base_t *s = (mp_obj_base_t *)MP_OBJ_TO_PTR(self);
