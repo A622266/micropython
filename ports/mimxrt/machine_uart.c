@@ -668,6 +668,15 @@ extern void __real_LPUART_TransferHandleIRQ(LPUART_Type *base, void *irqHandle);
 void __wrap_LPUART_TransferHandleIRQ(LPUART_Type *base, void *irqHandle);
 
 // SDK's ISR dispatch table - defined in lib/nxp_driver/sdk/drivers/lpuart/fsl_lpuart.c
+//
+// (Note, 2026-09: this repo's lib/nxp_driver submodule was found pinned at a stale
+// commit (fa5a554, missing the whole sdk/drivers/ tree the Makefile's SRC_C list
+// expects -- only sdk/devices/MIMXRT1062/drivers/ existed, an older/differently-laid-out
+// SDK where s_lpuartIsr really was a single scalar, which had made this line look wrong).
+// Bumped to origin/master (72fa606, "sdk_update_MCUX_2.16.100") while bringing up an
+// unrelated SPI DMA patch, which restored the modern sdk/drivers/ layout the Makefile
+// already assumed -- and confirmed this original array-typed declaration was correct for
+// that SDK all along.)
 extern lpuart_isr_t s_lpuartIsr[];
 
 // Wrapper for LPUART_TransferCreateHandle to inject our IRQ wrapper into SDK's dispatch table.
