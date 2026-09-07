@@ -952,16 +952,19 @@ void PIT_IRQHandler(void) {
         // against a directly register-verified 192kHz PIT period).
         (void)PIT_GetStatusFlags(PIT, SPI_ISR_PIT_CHANNEL);
         if (spi_isr_periodic_active && spi_isr_lpspi != NULL) {
-            // Poll FSR.TXCOUNT before each byte, waiting for FIFO room -- LPSPI4's TX
-            // FIFO is only 4 words deep (confirmed via PARAM register readback), and a
-            // raw STR to TDR is NOT paced against peripheral readiness the way eDMA bus
-            // transactions are; writing blindly into a full FIFO can silently lose
-            // bytes rather than stall, decoupling the wire from the intended one-frame-
-            // per-interrupt boundary. Safe to busy-wait here: worst case is ~4 byte
-            // times (~1.6us at 20MHz baud), far under the interrupt period.
+            // REVERTED (2026-09-07): an earlier version of this loop polled
+            // FSR.TXCOUNT before each byte, busy-waiting for FIFO room. That caused a
+            // genuine ISR deadlock on the bench (board became fully unresponsive,
+            // needing a physical reset) -- almost certainly because LPSPI does not
+            // drain its FIFO until it has received enough queued data to actually start
+            // shifting a frame, so waiting for "room" before supplying the REST of that
+            // same frame's bytes can wait forever. eDMA's own bus-level writes to TDR
+            // (used by dma_periodic_start()) never needed explicit polling -- AHB wait-
+            // states handle backpressure transparently -- so this reverts to the same
+            // blind-write approach; the still-open ~228.57kHz-vs-192kHz CS-pulse-rate
+            // mismatch (isr_periodic_count() proven correct via PIT register readback)
+            // needs a different explanation, not FIFO polling.
             for (size_t i = 0; i < spi_isr_frame_bytes; i++) {
-                while ((spi_isr_lpspi->FSR & LPSPI_FSR_TXCOUNT_MASK) >= 4U) {
-                }
                 spi_isr_lpspi->TDR = spi_isr_frame_buf[i];
             }
             spi_isr_periodic_count++;
