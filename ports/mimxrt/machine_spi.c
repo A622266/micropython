@@ -929,10 +929,25 @@ extern const mp_obj_fun_builtin_fixed_t machine_spi_deinit_obj; // MP_DEFINE_CON
 // for all its periodic-transfer extensions.
 #define SPI_ISR_PIT_CHANNEL kPIT_Chnl_1
 
+// Ring buffer, same double-buffering shape as dma_periodic_start()'s (see its own
+// comment) -- two halves, one being drained by the ISR while Python refills the other.
+// Unlike that buffer, this one is ONLY ever touched by the CPU (Python-side refill
+// writes via isr_periodic_write(), ISR-side reads below) -- no separate DMA bus master
+// is involved, so ordinary Cortex-M7 cache coherency between CPU loads/stores already
+// applies and no DCACHE_CleanByRange() calls are needed here, unlike the DMA mechanism.
+#define SPI_ISR_FRAMES_PER_HALF (64)
+
 static volatile bool spi_isr_periodic_active = false;
 static size_t spi_isr_frame_bytes = 0;
-static uint8_t spi_isr_frame_buf[16];
+static uint8_t *spi_isr_buffer = NULL;        // 2 * SPI_ISR_FRAMES_PER_HALF * spi_isr_frame_bytes
+static size_t spi_isr_half_bytes = 0;         // SPI_ISR_FRAMES_PER_HALF * spi_isr_frame_bytes
+static size_t spi_isr_frames_per_half = 0;    // == SPI_ISR_FRAMES_PER_HALF, cached to
+                                               // avoid a division in the ISR hot path
+static size_t spi_isr_read_index = 0;         // next FRAME (not byte) to send, wraps at
+                                               // 2 * spi_isr_frames_per_half
 static LPSPI_Type *spi_isr_lpspi = NULL;
+static mp_obj_t spi_isr_refill_callback = MP_OBJ_NULL;
+static bool spi_isr_io_update_enabled = false;
 volatile uint32_t spi_isr_periodic_count = 0;
 
 // Overrides the .weak default in startup_MIMXRT1062.S. PIT has a single shared IRQ
@@ -952,32 +967,17 @@ void PIT_IRQHandler(void) {
         // against a directly register-verified 192kHz PIT period).
         (void)PIT_GetStatusFlags(PIT, SPI_ISR_PIT_CHANNEL);
         if (spi_isr_periodic_active && spi_isr_lpspi != NULL) {
-            // Pack the frame into ceil(frame_bytes*8/32) genuine 32-bit WORDS and write
-            // TDR exactly that many times -- NOT once per content byte.
-            //
-            // History: an earlier fix here tried forcing byte-wide (STRB) TDR writes
-            // instead of the original plain `TDR = byte_value` (which is a 32-bit STR,
-            // since TDR is `volatile uint32_t`), theorizing the STR-vs-STRB bus-transfer
-            // width was why 9 single-byte writes per ISR call produced a wire rate stuck
-            // at LPSPI's own max throughput (~228.57kHz) instead of the ISR's correctly
-            // -paced 192kHz. Bench-tested 2026-09-07: switching STR->STRB (confirmed via
-            // objdump: a genuine `strb.w` was emitted) made ZERO measurable difference --
-            // identical CS-pulse delta histogram before and after. This falsifies the
-            // transfer-width theory and instead proves the LPSPI FIFO's push counter
-            // advances ONCE PER WRITE OPERATION to TDR, regardless of the AHB transfer
-            // width, not once per byte of real data supplied. Per the i.MX RT1060 RM
-            // (LPSPI chapter, FRAMESZ field description), a FRAMESZ>32 frame is built
-            // from discrete 32-bit-wide FIFO pushes -- a 72-bit frame is exactly 3
-            // pushes (32+32+8 bits), not 9. The old loop's 9 writes per ISR call (any
-            // width) supplied exactly enough pushes for 3 whole 72-bit frames, so LPSPI
-            // kept draining/re-arming itself back-to-back regardless of how often the
-            // ISR itself actually ran. Fix: build real 32-bit words (MSB-first per word,
-            // matching the RM's own multi-word frame example; a short final word is
-            // right-justified) and push one word at a time -- one push per FIFO word,
-            // not one push per content byte. This is also why the working DMA mechanism
-            // (dma_periodic_start()) never hit this: its eDMA TCD is programmed with the
-            // correct minor-loop byte count to produce exactly the right number of TDR
-            // pushes per frame, not a fixed per-byte push count.
+            // Pack the current ring-buffer frame into ceil(frame_bytes*8/32) genuine
+            // 32-bit WORDS and write TDR exactly that many times -- NOT once per
+            // content byte. See the fork's commit history (621030168) for the full
+            // story: an earlier per-byte-write version supplied enough FIFO pushes for
+            // 3 whole frames per real ISR call (LPSPI's push counter advances once per
+            // WRITE OPERATION to TDR, not once per byte), so it free-ran at LPSPI's own
+            // max throughput regardless of the ISR's true, correctly-paced rate. Fixed
+            // by pushing real 32-bit words (MSB-first per word, matching the i.MX RT1060
+            // RM's own multi-word FRAMESZ>32 example; a short final word is
+            // right-justified) -- one push per FIFO word, not one push per content byte.
+            uint8_t *frame = spi_isr_buffer + spi_isr_read_index * spi_isr_frame_bytes;
             size_t nbytes = spi_isr_frame_bytes;
             size_t i = 0;
             while (i < nbytes) {
@@ -987,38 +987,76 @@ void PIT_IRQHandler(void) {
                 }
                 uint32_t word = 0;
                 for (size_t j = 0; j < chunk; j++) {
-                    word = (word << 8) | spi_isr_frame_buf[i + j];
+                    word = (word << 8) | frame[i + j];
                 }
                 spi_isr_lpspi->TDR = word;
                 i += chunk;
             }
             spi_isr_periodic_count++;
+
+            // Advance the ring-buffer read position and, when a half boundary was just
+            // crossed, tell Python (via mp_sched_schedule -- runs on the main thread,
+            // not IRQ context, same as edma_spi_periodic_callback()'s own convention)
+            // which half needs fresh content. Report the half that needs refilling, not
+            // the one that just played -- matches dma_periodic's own callback contract
+            // exactly, so a caller can share refill logic between both mechanisms.
+            size_t prev_index = spi_isr_read_index;
+            spi_isr_read_index++;
+            if (spi_isr_read_index >= 2 * spi_isr_frames_per_half) {
+                spi_isr_read_index = 0;
+            }
+            if (spi_isr_refill_callback != MP_OBJ_NULL && spi_isr_refill_callback != mp_const_none) {
+                if (prev_index == spi_isr_frames_per_half - 1) {
+                    mp_sched_schedule(spi_isr_refill_callback, MP_OBJ_NEW_SMALL_INT(0));
+                } else if (prev_index == 2 * spi_isr_frames_per_half - 1) {
+                    mp_sched_schedule(spi_isr_refill_callback, MP_OBJ_NEW_SMALL_INT(1));
+                }
+            }
         }
     }
 }
 
-// spi.isr_periodic_start(frame_bytes, rate_hz, initial_buf) -- initial_buf (required, not
-// optional) sidesteps the same "trigger starts before real content is ready" race that
-// was found and fixed in dma_periodic_start(); there's no separate priming step here.
+// spi.isr_periodic_start(frame_bytes, rate_hz, refill_callback, io_update_enable=0)
+//
+// Same double-buffered-ring-buffer shape as dma_periodic_start() (see its own comment):
+// `refill_callback(half)` is scheduled each time a half-buffer has just been drained
+// and needs fresh frames written into it via isr_periodic_write(half, buf) -- lets
+// Python (or, eventually, the weaver_native C module) hand over a genuinely time-
+// varying stream of DDS register content in batches (~64 frames at a time, refilled
+// roughly every 64/rate_hz seconds -- comfortably slow enough for MicroPython), instead
+// of the previous single-static-frame design, which could only repeat one frame
+// indefinitely or be occasionally, expensively swapped from Python.
+//
+// `io_update_enable`: if truthy, reuses dma_periodic_start()'s own I/O_UPDATE mechanism
+// (LPSPI4_IRQHandler, pulsing D15 on LPSPI's own Frame-Complete flag) rather than
+// inventing a second, ISR-tick-relative timing scheme -- that interrupt fires whenever
+// LPSPI reports a real frame actually finished (PCS negated), regardless of whether
+// CPU-ISR writes (this mechanism) or eDMA (dma_periodic_start()) fed TDR, so it's
+// correct by construction for either. NOT yet bench-validated end-to-end with a live,
+// per-frame-varying content stream -- only with occasional, slowly-changing content (see
+// firmware/spi_dma_periodic_patch/README.md's pipeline-latency measurement).
 static mp_obj_t machine_spi_isr_periodic_start(size_t n_args, const mp_obj_t *args) {
     machine_spi_obj_t *self = MP_OBJ_TO_PTR(args[0]);
     mp_int_t frame_bytes = mp_obj_get_int(args[1]);
     mp_int_t rate_hz = mp_obj_get_int(args[2]);
-    mp_buffer_info_t buf;
-    mp_get_buffer_raise(args[3], &buf, MP_BUFFER_READ);
+    mp_obj_t refill_callback = args[3];
+    mp_int_t io_update_enable = (n_args > 4) ? mp_obj_get_int(args[4]) : 0;
 
     if (frame_bytes <= 0 || frame_bytes > 16) {
         mp_raise_ValueError(MP_ERROR_TEXT("frame_bytes out of range"));
-    }
-    if ((mp_int_t)buf.len != frame_bytes) {
-        mp_raise_ValueError(MP_ERROR_TEXT("initial buffer wrong length"));
     }
     if (spi_isr_periodic_active) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("isr_periodic already active"));
     }
 
-    memcpy(spi_isr_frame_buf, buf.buf, (size_t)frame_bytes);
     spi_isr_frame_bytes = (size_t)frame_bytes;
+    spi_isr_frames_per_half = SPI_ISR_FRAMES_PER_HALF;
+    spi_isr_half_bytes = spi_isr_frames_per_half * spi_isr_frame_bytes;
+    size_t total_bytes = 2 * spi_isr_half_bytes;
+    spi_isr_buffer = m_new(uint8_t, total_bytes);
+    memset(spi_isr_buffer, 0, total_bytes);
+    spi_isr_read_index = 0;
+    spi_isr_refill_callback = refill_callback;
     spi_isr_lpspi = self->spi_inst;
 
     // Widen FRAMESZ -- same read-modify-write precondition as dma_periodic_start() (at
@@ -1036,46 +1074,98 @@ static mp_obj_t machine_spi_isr_periodic_start(size_t n_args, const mp_obj_t *ar
         mp_raise_ValueError(MP_ERROR_TEXT("rate_hz too high to represent on PIT"));
     }
     PIT_SetTimerPeriod(PIT, SPI_ISR_PIT_CHANNEL, pit_ticks);
+
+    // I/O_UPDATE on D15, via the SAME LPSPI4 Frame-Complete interrupt dma_periodic_start()
+    // uses (see LPSPI4_IRQHandler and SPI_DMA_IO_UPDATE_GPIO_BASE/BIT's own comments
+    // above) -- shared physical pin/mechanism, not duplicated logic. That handler is
+    // mechanism-agnostic: it just pulses D15 whenever LPSPI reports a frame complete,
+    // regardless of what fed TDR.
+    spi_isr_io_update_enabled = (io_update_enable != 0);
+    if (spi_isr_io_update_enabled) {
+        IOMUXC_SetPinMux(IOMUXC_GPIO_AD_B1_03_GPIO1_IO19, 0U);
+        IOMUXC_SetPinConfig(IOMUXC_GPIO_AD_B1_03_GPIO1_IO19,
+            pin_generate_config(PIN_PULL_UP_100K, PIN_MODE_OUT, DEFAULT_SPI_DRIVE, 0x401F82F8U));
+        SPI_DMA_IO_UPDATE_GPIO_BASE->GDIR |= (1u << SPI_DMA_IO_UPDATE_GPIO_BIT);
+        SPI_DMA_IO_UPDATE_GPIO_BASE->DR_CLEAR = (1u << SPI_DMA_IO_UPDATE_GPIO_BIT); // start low
+        LPSPI_ClearStatusFlags(self->spi_inst, (uint32_t)kLPSPI_FrameCompleteFlag);
+        LPSPI_EnableInterrupts(self->spi_inst, (uint32_t)kLPSPI_FrameCompleteInterruptEnable);
+        EnableIRQ(LPSPI4_IRQn);
+    }
+
+    // Set active BEFORE the synchronous refill calls below, matching dma_periodic_
+    // start()'s own ordering (its refill callback's dma_periodic_write() calls are
+    // gated on the "active" flag; isr_periodic_write() is gated the same way here).
+    spi_isr_periodic_active = true;
+
+    // Synchronously populate BOTH ring-buffer halves with real content BEFORE arming
+    // the PIT trigger -- same bench-found race dma_periodic_start() already had to fix
+    // (see its own comment): starting the timer first and relying on the caller's
+    // refill(0)/refill(1) calls running later, as separate Python statements after this
+    // function returns, would let the first PIT tick(s) send the all-zero memset
+    // content.
+    if (spi_isr_refill_callback != MP_OBJ_NULL && spi_isr_refill_callback != mp_const_none) {
+        mp_call_function_1(spi_isr_refill_callback, MP_OBJ_NEW_SMALL_INT(0));
+        mp_call_function_1(spi_isr_refill_callback, MP_OBJ_NEW_SMALL_INT(1));
+    }
+
     PIT_EnableInterrupts(PIT, SPI_ISR_PIT_CHANNEL, (uint32_t)kPIT_TimerInterruptEnable);
     EnableIRQ(PIT_IRQn);
-
-    spi_isr_periodic_active = true;
     PIT_StartTimer(PIT, SPI_ISR_PIT_CHANNEL);
 
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(machine_spi_isr_periodic_start_obj, 4, 4, machine_spi_isr_periodic_start);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(machine_spi_isr_periodic_start_obj, 4, 5, machine_spi_isr_periodic_start);
 
-// spi.isr_periodic_write(buf) -- update the frame content the ISR sends each tick.
-static mp_obj_t machine_spi_isr_periodic_write(mp_obj_t self_in, mp_obj_t buf_in) {
+// spi.isr_periodic_write(half, buf) -- copy buf (must be exactly
+// SPI_ISR_FRAMES_PER_HALF * frame_bytes long) into the specified half (0=bottom,
+// 1=top) of the internal ring buffer. Intended to be called from the refill_callback
+// passed to isr_periodic_start(), using the `half` value that callback was invoked
+// with -- mirrors dma_periodic_write()'s API exactly (no DCACHE call needed here, see
+// the ring-buffer comment above).
+static mp_obj_t machine_spi_isr_periodic_write(mp_obj_t self_in, mp_obj_t half_in, mp_obj_t buf_in) {
     (void)self_in;
+    mp_int_t half = mp_obj_get_int(half_in);
     if (!spi_isr_periodic_active) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("isr_periodic not active"));
     }
     mp_buffer_info_t buf;
     mp_get_buffer_raise(buf_in, &buf, MP_BUFFER_READ);
-    if (buf.len != spi_isr_frame_bytes) {
-        mp_raise_ValueError(MP_ERROR_TEXT("buffer wrong length"));
+    if (buf.len != spi_isr_half_bytes) {
+        mp_raise_ValueError(MP_ERROR_TEXT("buffer wrong length for one half"));
     }
     // Briefly disable the PIT interrupt to make the buffer swap atomic (avoid the ISR
-    // reading a torn write mid-copy) -- cheap, since this write path only runs at
-    // whatever (much slower) rate the caller updates content, not at rate_hz itself.
+    // reading a torn write mid-copy) -- cheap and brief (a ~576-byte memcpy at 600MHz),
+    // and the caller is expected to refill the half the ISR just finished draining
+    // (i.e. NOT the half it's currently reading from), so this is a defensive measure,
+    // not a load-bearing assumption.
     PIT_DisableInterrupts(PIT, SPI_ISR_PIT_CHANNEL, (uint32_t)kPIT_TimerInterruptEnable);
-    memcpy(spi_isr_frame_buf, buf.buf, buf.len);
+    uint8_t *dest = spi_isr_buffer + (half ? spi_isr_half_bytes : 0);
+    memcpy(dest, buf.buf, spi_isr_half_bytes);
     PIT_EnableInterrupts(PIT, SPI_ISR_PIT_CHANNEL, (uint32_t)kPIT_TimerInterruptEnable);
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_2(machine_spi_isr_periodic_write_obj, machine_spi_isr_periodic_write);
+static MP_DEFINE_CONST_FUN_OBJ_3(machine_spi_isr_periodic_write_obj, machine_spi_isr_periodic_write);
 
 static mp_obj_t machine_spi_isr_periodic_stop(mp_obj_t self_in) {
     (void)self_in;
     if (!spi_isr_periodic_active) {
         return mp_const_none;
     }
+    spi_isr_periodic_active = false;
     PIT_StopTimer(PIT, SPI_ISR_PIT_CHANNEL);
     PIT_DisableInterrupts(PIT, SPI_ISR_PIT_CHANNEL, (uint32_t)kPIT_TimerInterruptEnable);
-    spi_isr_periodic_active = false;
+    if (spi_isr_io_update_enabled) {
+        // Harmless if dma_periodic_start() also enabled the same interrupt for its own
+        // use -- not intended to run concurrently with this mechanism (see the module
+        // comment), and disabling here just means "this mechanism no longer needs it,"
+        // matching dma_periodic_stop()'s own comment about not churning EnableIRQ/
+        // DisableIRQ on the NVIC itself.
+        LPSPI_DisableInterrupts(spi_isr_lpspi, (uint32_t)kLPSPI_FrameCompleteInterruptEnable);
+        spi_isr_io_update_enabled = false;
+    }
     spi_isr_lpspi = NULL;
+    spi_isr_refill_callback = MP_OBJ_NULL;
+    spi_isr_buffer = NULL;
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(machine_spi_isr_periodic_stop_obj, machine_spi_isr_periodic_stop);
