@@ -783,9 +783,31 @@ static mp_obj_t machine_spi_dma_periodic_start(size_t n_args, const mp_obj_t *ar
     EDMA_InstallTCD(DMA0, self->dma_channel, self->dma_edmaTcd);
     EDMA_StartTransfer(&self->dma_edmaHandle);
 
+    // Set active BEFORE the synchronous refill calls below, since the refill callback's
+    // own dma_periodic_write() calls are gated on this flag.
+    self->dma_periodic_active = true;
+
+    // Synchronously populate BOTH ring-buffer halves with real content BEFORE arming the
+    // PIT trigger -- bench-found bug (2026-09-07): starting the trigger first and relying
+    // on the caller's own refill(0)/refill(1) calls (made AFTER this function returns, as
+    // separate Python statements) left a real race. The buffer was still all-zero (from
+    // the memset above) when the very first PIT tick(s) fired, sending a malformed
+    // all-zero "frame" that AD9910 (or any SPI target with a similar multi-byte-register
+    // serial protocol) would misinterpret as addressing the wrong register with the wrong
+    // byte count -- exactly the kind of malformed communication cycle the AD9910
+    // datasheet documents as permanently desyncing its serial port's byte-boundary
+    // tracking until an explicit I/O_RESET pulse. Confirmed on the bench: output was
+    // corrupted from essentially the very first capture even with I/O_UPDATE completely
+    // disabled and rate_hz slowed to 50kHz -- ruling out a timing-jitter-accumulation
+    // explanation (which would predict correct-then-degrading behavior, not immediate
+    // failure) and pointing squarely at day-one buffer content instead.
+    if (self->dma_refill_callback != MP_OBJ_NULL && self->dma_refill_callback != mp_const_none) {
+        mp_call_function_1(self->dma_refill_callback, MP_OBJ_NEW_SMALL_INT(0));
+        mp_call_function_1(self->dma_refill_callback, MP_OBJ_NEW_SMALL_INT(1));
+    }
+
     PIT_StartTimer(PIT, SPI_DMA_PIT_CHANNEL);
 
-    self->dma_periodic_active = true;
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(machine_spi_dma_periodic_start_obj, 4, 6, machine_spi_dma_periodic_start);
