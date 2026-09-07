@@ -545,6 +545,18 @@ volatile uint32_t spi_dma_io_update_isr_count = 0;
 // pattern is ever reused for a different SPI(0) use case at the same time.
 void LPSPI4_IRQHandler(void) {
     LPSPI_ClearStatusFlags(LPSPI4, (uint32_t)kLPSPI_FrameCompleteFlag);
+    // Dummy read-back immediately after the write-1-to-clear write, before doing
+    // anything else -- bench-found bug (2026-09-07): without this, the M2K digital
+    // capture showed I/O_UPDATE toggling at EXACTLY 2x the real frame rate (384 rising
+    // edges against 192 real CS-low pulses in the same 1ms window). Root cause: the SR
+    // write is posted on the bus and doesn't necessarily complete before the ISR
+    // returns; if the NVIC re-samples LPSPI4's IRQ line before the peripheral has
+    // actually registered the clear, it sees FCF still asserted and re-enters this ISR
+    // immediately for the same underlying event, toggling I/O_UPDATE a second, spurious
+    // time. This is a standard ARM/Cortex-M idiom for W1C peripheral status registers --
+    // a read-back forces the preceding write to complete before proceeding, rather than
+    // leaving it in flight when the ISR exits.
+    (void)LPSPI4->SR;
     spi_dma_io_update_isr_count++;
     SPI_DMA_IO_UPDATE_GPIO_BASE->DR_SET = (1u << SPI_DMA_IO_UPDATE_GPIO_BIT);
     // AD9910's own I/O_UPDATE minimum pulse width is only ">1 SYNC_CLK cycle" (datasheet,
