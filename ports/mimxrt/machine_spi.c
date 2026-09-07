@@ -952,28 +952,45 @@ void PIT_IRQHandler(void) {
         // against a directly register-verified 192kHz PIT period).
         (void)PIT_GetStatusFlags(PIT, SPI_ISR_PIT_CHANNEL);
         if (spi_isr_periodic_active && spi_isr_lpspi != NULL) {
-            // Byte-wide writes via an explicit uint8_t pointer cast -- NOT
-            // `spi_isr_lpspi->TDR = byte_value`, which was the actual root cause of the
-            // ~228.57kHz-vs-192kHz CS-pulse-rate mismatch this replaces (bench-found
-            // 2026-09-07). TDR is declared `volatile uint32_t` in the SDK header, so a
-            // plain assignment from a uint8_t value compiles to a full 32-bit store
-            // (STR), zero-extended -- not a genuine byte-wide bus transaction. Per the
-            // i.MX RT1060 RM (LPSPI chapter, FRAMESZ field description), a FRAMESZ>32
-            // frame is built from discrete 32-bit-wide WORD loads (e.g. a 72-bit frame
-            // is 3 words: 32+32+8 bits) -- each of the 9 plain-assignment "byte" writes
-            // this loop used to do was very likely being counted as delivering an entire
-            // 32-bit word rather than 8 bits, supplying enough words for roughly 3
-            // frames per real ISR call (9 writes / 3 words-per-frame) and explaining why
-            // LPSPI ran flat-out at its own max throughput regardless of the ISR's own
-            // correctly-paced 192kHz rate. The working DMA-driven mechanism
-            // (dma_periodic_start()) never hit this: eDMA's minor-loop beats are
-            // genuine hardware-level byte-wide (SSIZE=1) bus transactions, configured
-            // directly in the TCD, with no C-typed pointer dereference to go through.
-            // A byte pointer cast here forces the compiler to emit STRB instead of STR,
-            // matching eDMA's actual bus behavior.
-            volatile uint8_t *tdr8 = (volatile uint8_t *)&spi_isr_lpspi->TDR;
-            for (size_t i = 0; i < spi_isr_frame_bytes; i++) {
-                *tdr8 = spi_isr_frame_buf[i];
+            // Pack the frame into ceil(frame_bytes*8/32) genuine 32-bit WORDS and write
+            // TDR exactly that many times -- NOT once per content byte.
+            //
+            // History: an earlier fix here tried forcing byte-wide (STRB) TDR writes
+            // instead of the original plain `TDR = byte_value` (which is a 32-bit STR,
+            // since TDR is `volatile uint32_t`), theorizing the STR-vs-STRB bus-transfer
+            // width was why 9 single-byte writes per ISR call produced a wire rate stuck
+            // at LPSPI's own max throughput (~228.57kHz) instead of the ISR's correctly
+            // -paced 192kHz. Bench-tested 2026-09-07: switching STR->STRB (confirmed via
+            // objdump: a genuine `strb.w` was emitted) made ZERO measurable difference --
+            // identical CS-pulse delta histogram before and after. This falsifies the
+            // transfer-width theory and instead proves the LPSPI FIFO's push counter
+            // advances ONCE PER WRITE OPERATION to TDR, regardless of the AHB transfer
+            // width, not once per byte of real data supplied. Per the i.MX RT1060 RM
+            // (LPSPI chapter, FRAMESZ field description), a FRAMESZ>32 frame is built
+            // from discrete 32-bit-wide FIFO pushes -- a 72-bit frame is exactly 3
+            // pushes (32+32+8 bits), not 9. The old loop's 9 writes per ISR call (any
+            // width) supplied exactly enough pushes for 3 whole 72-bit frames, so LPSPI
+            // kept draining/re-arming itself back-to-back regardless of how often the
+            // ISR itself actually ran. Fix: build real 32-bit words (MSB-first per word,
+            // matching the RM's own multi-word frame example; a short final word is
+            // right-justified) and push one word at a time -- one push per FIFO word,
+            // not one push per content byte. This is also why the working DMA mechanism
+            // (dma_periodic_start()) never hit this: its eDMA TCD is programmed with the
+            // correct minor-loop byte count to produce exactly the right number of TDR
+            // pushes per frame, not a fixed per-byte push count.
+            size_t nbytes = spi_isr_frame_bytes;
+            size_t i = 0;
+            while (i < nbytes) {
+                size_t chunk = nbytes - i;
+                if (chunk > 4) {
+                    chunk = 4;
+                }
+                uint32_t word = 0;
+                for (size_t j = 0; j < chunk; j++) {
+                    word = (word << 8) | spi_isr_frame_buf[i + j];
+                }
+                spi_isr_lpspi->TDR = word;
+                i += chunk;
             }
             spi_isr_periodic_count++;
         }
