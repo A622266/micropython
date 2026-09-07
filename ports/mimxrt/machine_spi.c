@@ -39,7 +39,6 @@
 #include "fsl_lpspi.h"
 #include "fsl_lpspi_edma.h"
 #include "fsl_pit.h"
-#include "fsl_xbara.h"
 #include "dma_manager.h"
 
 // --- Periodic DMA transfer extension (SPI.dma_periodic_start() and friends) ---
@@ -245,20 +244,13 @@
 #define SPI_DMA_DMAMUX_CHANNEL      (0u)
 #define SPI_DMA_LPSPI4_TX_DMAMUX_SRC kDmaRequestMuxLPSPI4Tx
 
-// I/O_UPDATE rise/fall: two more PIT channels, same PERCLK root as SPI_DMA_PIT_CHANNEL
-// above, each routed through its own XBARA1 input/output pair to its own small eDMA
-// channel that toggles pin D15 (GPIO1 bit 19) directly via GPIO1's DR_SET/DR_CLEAR
-// registers. See the module-level comment for why this replaced TMR3's PWM and how the
-// fixed phase offset between these and SPI_DMA_PIT_CHANNEL is created.
-#define SPI_DMA_IO_UPDATE_RISE_PIT_CHANNEL   kPIT_Chnl_1
-#define SPI_DMA_IO_UPDATE_RISE_XBAR_INPUT    kXBARA1_InputPitTrigger1
-#define SPI_DMA_IO_UPDATE_RISE_XBAR_OUTPUT   kXBARA1_OutputDmaChMuxReq31
-#define SPI_DMA_IO_UPDATE_RISE_DMAMUX_SRC    kDmaRequestMuxXBAR1Request1
-#define SPI_DMA_IO_UPDATE_FALL_PIT_CHANNEL   kPIT_Chnl_2
-#define SPI_DMA_IO_UPDATE_FALL_XBAR_INPUT    kXBARA1_InputPitTrigger2
-#define SPI_DMA_IO_UPDATE_FALL_XBAR_OUTPUT   kXBARA1_OutputDmaChMuxReq94
-#define SPI_DMA_IO_UPDATE_FALL_DMAMUX_SRC    kDmaRequestMuxXBAR1Request2
-
+// I/O_UPDATE on pin D15 (GPIO1 bit 19): toggled directly from LPSPI4's own Frame-
+// Complete interrupt (LPSPI4_IRQHandler, defined further down) rather than from a
+// timer/eDMA mechanism -- see that ISR's own comment, and the module-level comment
+// above, for why (bench-confirmed DMAMUX trigger-latency jitter made any fixed-phase
+// timer-based scheme unsafe; ties I/O_UPDATE to the actual frame-complete event
+// instead of a guessed delay).
+//
 // D15 = SoC pad GPIO_AD_B1_03 = GPIO1 bit 19 in plain-GPIO alt-function mode (confirmed
 // via IOMUXC_GPIO_AD_B1_03_GPIO1_IO19, sdk/devices/MIMXRT1062/drivers/fsl_iomuxc.h).
 #define SPI_DMA_IO_UPDATE_GPIO_BASE  GPIO1
@@ -291,14 +283,6 @@ typedef struct _machine_spi_obj_t {
     edma_handle_t dma_edmaHandle;
     edma_tcd_t *dma_edmaTcd;
     mp_obj_t dma_refill_callback;         // called via mp_sched_schedule(cb, half_index)
-
-    // --- I/O_UPDATE rise/fall eDMA channels (GPIO1 DR_SET/DR_CLEAR toggle via PIT
-    // channels 1/2 + XBARA1, not TMR3 -- see the module-level comment block). Only
-    // valid while dma_periodic_active is true, same as the fields above.
-    int dma_io_update_set_channel;
-    int dma_io_update_clear_channel;
-    edma_handle_t dma_io_update_set_edmaHandle;
-    edma_handle_t dma_io_update_clear_edmaHandle;
 } machine_spi_obj_t;
 
 typedef struct _iomux_table_t {
@@ -391,8 +375,6 @@ mp_obj_t machine_spi_make_new(const mp_obj_type_t *type, size_t n_args, size_t n
     self->dma_periodic_active = false;
     self->dma_buffer = NULL;
     self->dma_refill_callback = MP_OBJ_NULL;
-    self->dma_io_update_set_channel = -1;
-    self->dma_io_update_clear_channel = -1;
 
     uint8_t drive = args[ARG_drive].u_int;
     if (drive < 1 || drive > 7) {
@@ -518,16 +500,6 @@ static const mp_machine_spi_p_t machine_spi_p = {
 // edmaTcd[I2S_NUM_OBJ_SLOTS], 32) pattern, sized 1 instead of I2S_NUM_OBJ_SLOTS.
 AT_NONCACHEABLE_SECTION_ALIGN(static edma_tcd_t spi_dma_tcd, 32);
 
-// TCD storage + constant source words for the two I/O_UPDATE toggle channels (GPIO1
-// DR_SET/DR_CLEAR writes). Each is a single fixed 4-byte transfer per PIT trigger, self-
-// linked like spi_dma_tcd above -- no ring buffer needed since the content never
-// changes, only the destination register (SET vs CLEAR) differs between the two. Living
-// in a non-cacheable section (like spi_dma_tcd) means no DCACHE_CleanByRange() call is
-// needed even though dma_periodic_start() writes the mask value at runtime.
-AT_NONCACHEABLE_SECTION_ALIGN(static edma_tcd_t spi_dma_io_update_set_tcd, 32);
-AT_NONCACHEABLE_SECTION_ALIGN(static edma_tcd_t spi_dma_io_update_clear_tcd, 32);
-AT_NONCACHEABLE_SECTION_ALIGN(static uint32_t spi_dma_io_update_gpio_bit_mask, 4);
-
 // Diagnostic-only counter (2026-09-06): increments unconditionally, at ISR level, every
 // time this callback runs at all -- independent of whether mp_sched_schedule() actually
 // gets serviced by the Python side. Used to separate "the eDMA interrupt never fires" from
@@ -547,6 +519,40 @@ static void edma_spi_periodic_callback(edma_handle_t *handle, void *userData, bo
         mp_sched_schedule(self->dma_refill_callback,
             MP_OBJ_NEW_SMALL_INT(transferDone ? 0 : 1));
     }
+}
+
+// Diagnostic-only counter, same idea as spi_dma_isr_count above: how many times the
+// I/O_UPDATE ISR has actually fired, independent of anything else.
+volatile uint32_t spi_dma_io_update_isr_count = 0;
+
+// LPSPI4's Frame-Complete interrupt handler -- overrides the .weak default in
+// startup_MIMXRT1062.S (standard bare-metal override-by-strong-symbol pattern; no
+// NVIC_SetVector() call needed, matches how e.g. machine_uart.c's LPUART IRQ handlers
+// work in this same port). Fires once per completed SPI frame (LPSPI's own Frame
+// Complete flag, FCF: "PCS has negated" per the i.MX RT1060 RM Table 48-6) -- this IS
+// the actual event I/O_UPDATE needs to follow, not a guess at when it might happen; see
+// dma_periodic_start()'s own I/O_UPDATE comment for why this replaced the earlier
+// PIT-timed mechanisms. Deliberately minimal: clear the flag, pulse the pin, return --
+// this runs at 192kHz in the target application, so every extra instruction here is
+// direct, permanent overhead against the DSP pipeline's cycle budget.
+//
+// This whole ISR only exists because this SPI object had dma_periodic_start() called
+// with io_update_duty_u16 > 0 -- if some OTHER, unrelated code enabled LPSPI4's frame-
+// complete interrupt for its own purposes while this feature is also active, the two
+// would collide (this handler unconditionally treats every LPSPI4 frame-complete as "an
+// AD9910 register frame just finished, pulse I/O_UPDATE"). Not a concern for this
+// project (SPI(0)/LPSPI4 is dedicated to the phase path), but a real constraint if this
+// pattern is ever reused for a different SPI(0) use case at the same time.
+void LPSPI4_IRQHandler(void) {
+    LPSPI_ClearStatusFlags(LPSPI4, (uint32_t)kLPSPI_FrameCompleteFlag);
+    spi_dma_io_update_isr_count++;
+    SPI_DMA_IO_UPDATE_GPIO_BASE->DR_SET = (1u << SPI_DMA_IO_UPDATE_GPIO_BIT);
+    // AD9910's own I/O_UPDATE minimum pulse width is only ">1 SYNC_CLK cycle" (datasheet,
+    // I/O_UPDATE/PROFILE[2:0] Timing Characteristics) -- a handful of nanoseconds, far
+    // less than the instructions between the two GPIO writes above/below already take at
+    // 600MHz. No explicit delay loop is needed; kept implicit rather than adding a NOP
+    // loop whose "safe" iteration count would itself be an unverified guess.
+    SPI_DMA_IO_UPDATE_GPIO_BASE->DR_CLEAR = (1u << SPI_DMA_IO_UPDATE_GPIO_BIT);
 }
 
 // spi.dma_periodic_start(frame_bytes, rate_hz, refill_callback, io_update_duty_u16=0,
@@ -620,15 +626,6 @@ static mp_obj_t machine_spi_dma_periodic_start(size_t n_args, const mp_obj_t *ar
     }
     PIT_SetTimerPeriod(PIT, SPI_DMA_PIT_CHANNEL, pit_ticks);
 
-    // XBARA1 is still needed below for the I/O_UPDATE rise/fall channels (unrelated to
-    // this revision -- those were already proven correct on the bench and are untouched
-    // here); the SPI trigger itself no longer uses it.
-    XBARA_Init(XBARA1);
-    xbara_control_config_t xbar_ctrl_config = {
-        .activeEdge = kXBARA_EdgeRising,
-        .requestType = kXBARA_RequestDMAEnable,
-    };
-
     // DMAMUX and eDMA (DMA0) must both be initialized before ANY channel is touched --
     // moved up here (both idempotent, DMAMUX_Init() resets/enables the whole module and
     // dma_init() itself is internally guarded against being called twice) because the
@@ -656,37 +653,45 @@ static mp_obj_t machine_spi_dma_periodic_start(size_t n_args, const mp_obj_t *ar
     DMAMUX_EnablePeriodTrigger(DMAMUX, SPI_DMA_DMAMUX_CHANNEL);
     LPSPI_EnableDMA(self->spi_inst, kLPSPI_TxDmaEnable);
 
-    // --- I/O_UPDATE on pin D15, via PIT channels 1/2 + XBARA1 + two small self-linked
-    // eDMA channels toggling GPIO1 directly (DR_SET/DR_CLEAR). See the module-level
-    // comment for why this replaced TMR3's PWM (a real, bench-confirmed clock-domain
-    // drift between PIT/PERCLK and QTMR/IPG_CLK) and how the fixed phase offset below is
-    // created. io_update_duty_u16 == 0 keeps the previous "no I/O_UPDATE pulse
-    // generated" behavior -- this call alone still isn't sufficient for a working DDS
-    // update path without it.
+    // --- I/O_UPDATE on pin D15, via LPSPI4's own Frame-Complete interrupt (2026-09-07,
+    // THIRD revision -- see the module-level comment above for the full history: TMR3
+    // PWM had cross-clock-domain drift; PIT+XBARA1+eDMA-GPIO-toggle was driftless but
+    // still a BLIND, statically-timed guess at when the SPI frame would finish, and
+    // bench testing found DMAMUX's own trigger-to-transfer latency jitters enough
+    // (cycling through states whose worst case exceeds one whole PIT period) that NO
+    // fixed phase offset can be guaranteed safe -- confirmed on the bench, not derived
+    // from a datasheet table, since the RM itself only says trigger-to-transfer latency
+    // "cannot be guaranteed," not by how much.
+    //
+    // This revision ties I/O_UPDATE directly to the ACTUAL event it needs to follow --
+    // LPSPI's own Frame Complete flag (FCF), defined in the i.MX RT1060 RM (Table 48-6)
+    // as "Frame complete, PCS has negated" -- instead of a statically-computed delay.
+    // This is correct BY CONSTRUCTION regardless of DMAMUX's latency jitter, since it
+    // fires exactly when the frame the caller cares about has actually finished, not
+    // some fixed time after the frame was nominally requested.
+    //
+    // FCF has NO DMA-request capability (RM Table 48-6 lists only TDF/RDF as DMA-request
+    // -capable flags) and the LPSPI IP block's own "frame output trigger" (RM section
+    // 48.3.5.1) -- which asserts exactly at PCS negation, in principle routable to other
+    // peripherals -- is NOT wired to anything on this specific chip (checked: absent
+    // from both the DMAMUX source table, RM section 4.4, and the XBAR1 input table, RM
+    // section 4.6). So there is no CPU-free hardware path from "frame complete" to a
+    // GPIO toggle on this SoC -- an actual CPU interrupt is required. AD9910's own
+    // timing budget makes this comfortable: I/O_UPDATE's minimum pulse width is only
+    // ">1 SYNC_CLK cycle" and setup/hold times are 0-1.75ns (AD9910 datasheet,
+    // I/O_UPDATE/PROFILE[2:0] Timing Characteristics) -- trivial for even a few Cortex-M7
+    // instructions to satisfy, and Cortex-M7 ISR entry/exit latency (order of 10-20
+    // cycles) is a tiny fraction of the 5.2us/sample budget at 192kHz.
+    //
+    // io_update_duty_u16 == 0 keeps the previous "no I/O_UPDATE pulse generated"
+    // behavior. Any nonzero value now just means "enabled" -- the exact numeric duty
+    // value no longer sets a timed pulse width (there is no timer involved any more);
+    // the ISR's own short, fixed instruction sequence between DR_SET and DR_CLEAR is the
+    // pulse width. io_update_phase_ticks is accepted for call-site compatibility but is
+    // now meaningless (there is no phase to tune -- I/O_UPDATE fires when the frame
+    // actually completes, not at a caller-guessed offset) and is otherwise unused.
+    (void)io_update_phase_ticks;
     if (io_update_duty_u16 > 0) {
-        // Both offsets are PIT ticks counted from the same t=0 that SPI_DMA_PIT_CHANNEL
-        // itself starts from (its own PIT_StartTimer() call is below, right after these
-        // channels' own). Default phase, if the caller passes 0: land the rising edge
-        // 80% through the period, leaving margin both for the SPI frame to finish
-        // clocking out ahead of it and for the pulse width behind it -- a starting
-        // point, NOT a bench-derived value; see the module comment's open-items list.
-        uint32_t phase_ticks = (io_update_phase_ticks > 0)
-            ? (uint32_t)io_update_phase_ticks
-            : (pit_ticks * 4) / 5;
-        uint32_t pulse_width_ticks = (uint32_t)(((uint64_t)pit_ticks * (uint32_t)io_update_duty_u16) / 65536);
-        if (pulse_width_ticks < 1) {
-            pulse_width_ticks = 1;
-        }
-        if (phase_ticks < 1) {
-            phase_ticks = 1;
-        }
-        if (phase_ticks + pulse_width_ticks >= pit_ticks) {
-            if (phase_ticks + 1 >= pit_ticks) {
-                mp_raise_ValueError(MP_ERROR_TEXT("io_update_phase_ticks leaves no room in the period"));
-            }
-            pulse_width_ticks = pit_ticks - phase_ticks - 1;
-        }
-
         // D15 as plain GPIO output (ALT5, GPIO1 bit 19) instead of QTIMER3_TIMER3 -- see
         // the module comment for the pin-mux fact this depends on. Same
         // SetPinMux+SetPinConfig pairing as lpspi_set_iomux() (a real bug -- a missing
@@ -697,69 +702,14 @@ static mp_obj_t machine_spi_dma_periodic_start(size_t n_args, const mp_obj_t *ar
             pin_generate_config(PIN_PULL_UP_100K, PIN_MODE_OUT, DEFAULT_SPI_DRIVE, 0x401F82F8U));
         SPI_DMA_IO_UPDATE_GPIO_BASE->GDIR |= (1u << SPI_DMA_IO_UPDATE_GPIO_BIT);
         SPI_DMA_IO_UPDATE_GPIO_BASE->DR_CLEAR = (1u << SPI_DMA_IO_UPDATE_GPIO_BIT); // start low
-        spi_dma_io_update_gpio_bit_mask = (1u << SPI_DMA_IO_UPDATE_GPIO_BIT);
 
-        // --- PIT channels 1 (rise) and 2 (fall): one-shot short LDVAL, started, then
-        // immediately rewritten to the full period -- see the module comment for why
-        // this creates a fixed, driftless offset instead of a running calibration.
-        PIT_SetTimerPeriod(PIT, SPI_DMA_IO_UPDATE_RISE_PIT_CHANNEL, phase_ticks);
-        XBARA_SetSignalsConnection(XBARA1, SPI_DMA_IO_UPDATE_RISE_XBAR_INPUT, SPI_DMA_IO_UPDATE_RISE_XBAR_OUTPUT);
-        XBARA_SetOutputSignalConfig(XBARA1, SPI_DMA_IO_UPDATE_RISE_XBAR_OUTPUT, &xbar_ctrl_config);
-
-        PIT_SetTimerPeriod(PIT, SPI_DMA_IO_UPDATE_FALL_PIT_CHANNEL, phase_ticks + pulse_width_ticks);
-        XBARA_SetSignalsConnection(XBARA1, SPI_DMA_IO_UPDATE_FALL_XBAR_INPUT, SPI_DMA_IO_UPDATE_FALL_XBAR_OUTPUT);
-        XBARA_SetOutputSignalConfig(XBARA1, SPI_DMA_IO_UPDATE_FALL_XBAR_OUTPUT, &xbar_ctrl_config);
-
-        // --- Two small eDMA channels: each a single fixed 4-byte write of the same
-        // constant bitmask into GPIO1's DR_SET (rise) or DR_CLEAR (fall), self-linked so
-        // they keep re-arming forever with no CPU/interrupt involvement -- fire-and-
-        // forget, no EDMA_SetCallback, nothing needs to run in software when these fire.
-        self->dma_io_update_set_channel = allocate_dma_channel();
-        self->dma_io_update_clear_channel = allocate_dma_channel();
-        if (self->dma_io_update_set_channel < 0 || self->dma_io_update_clear_channel < 0) {
-            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("no DMA channel available for I/O_UPDATE"));
-        }
-        DMAMUX_SetSource(DMAMUX, self->dma_io_update_set_channel, SPI_DMA_IO_UPDATE_RISE_DMAMUX_SRC);
-        DMAMUX_EnableChannel(DMAMUX, self->dma_io_update_set_channel);
-        DMAMUX_SetSource(DMAMUX, self->dma_io_update_clear_channel, SPI_DMA_IO_UPDATE_FALL_DMAMUX_SRC);
-        DMAMUX_EnableChannel(DMAMUX, self->dma_io_update_clear_channel);
-
-        EDMA_CreateHandle(&self->dma_io_update_set_edmaHandle, DMA0, self->dma_io_update_set_channel);
-        EDMA_ResetChannel(DMA0, self->dma_io_update_set_channel);
-        edma_transfer_config_t io_update_set_config;
-        EDMA_PrepareTransfer(&io_update_set_config,
-            &spi_dma_io_update_gpio_bit_mask, 4,
-            (void *)&SPI_DMA_IO_UPDATE_GPIO_BASE->DR_SET, 4,
-            4, 4, kEDMA_MemoryToPeripheral);
-        memset(&spi_dma_io_update_set_tcd, 0, sizeof(edma_tcd_t));
-        EDMA_TcdSetTransferConfig(&spi_dma_io_update_set_tcd, &io_update_set_config, &spi_dma_io_update_set_tcd);
-        EDMA_InstallTCD(DMA0, self->dma_io_update_set_channel, &spi_dma_io_update_set_tcd);
-        EDMA_StartTransfer(&self->dma_io_update_set_edmaHandle);
-
-        EDMA_CreateHandle(&self->dma_io_update_clear_edmaHandle, DMA0, self->dma_io_update_clear_channel);
-        EDMA_ResetChannel(DMA0, self->dma_io_update_clear_channel);
-        edma_transfer_config_t io_update_clear_config;
-        EDMA_PrepareTransfer(&io_update_clear_config,
-            &spi_dma_io_update_gpio_bit_mask, 4,
-            (void *)&SPI_DMA_IO_UPDATE_GPIO_BASE->DR_CLEAR, 4,
-            4, 4, kEDMA_MemoryToPeripheral);
-        memset(&spi_dma_io_update_clear_tcd, 0, sizeof(edma_tcd_t));
-        EDMA_TcdSetTransferConfig(&spi_dma_io_update_clear_tcd, &io_update_clear_config, &spi_dma_io_update_clear_tcd);
-        EDMA_InstallTCD(DMA0, self->dma_io_update_clear_channel, &spi_dma_io_update_clear_tcd);
-        EDMA_StartTransfer(&self->dma_io_update_clear_edmaHandle);
-
-        PIT_StartTimer(PIT, SPI_DMA_IO_UPDATE_RISE_PIT_CHANNEL);
-        PIT_StartTimer(PIT, SPI_DMA_IO_UPDATE_FALL_PIT_CHANNEL);
-        // Rewrite both LDVALs to the real period now that each channel has already
-        // latched its short one-shot value into CVAL at start -- per fsl_pit.h, this
-        // only takes effect on the SECOND and later reloads (see the module comment),
-        // leaving both channels offset from SPI_DMA_PIT_CHANNEL by phase_ticks /
-        // phase_ticks+pulse_width_ticks forever, with zero drift between them.
-        PIT_SetTimerPeriod(PIT, SPI_DMA_IO_UPDATE_RISE_PIT_CHANNEL, pit_ticks);
-        PIT_SetTimerPeriod(PIT, SPI_DMA_IO_UPDATE_FALL_PIT_CHANNEL, pit_ticks);
-    } else {
-        self->dma_io_update_set_channel = -1;
-        self->dma_io_update_clear_channel = -1;
+        // Clear any stale FCF (write-1-to-clear status register) before enabling the
+        // interrupt, so a frame completed earlier (e.g. during the priming blocking
+        // write this call's precondition requires) doesn't cause an immediate spurious
+        // firing the instant the interrupt is unmasked.
+        LPSPI_ClearStatusFlags(self->spi_inst, (uint32_t)kLPSPI_FrameCompleteFlag);
+        LPSPI_EnableInterrupts(self->spi_inst, (uint32_t)kLPSPI_FrameCompleteInterruptEnable);
+        EnableIRQ(LPSPI4_IRQn);
     }
 
     // --- LPSPI frame-size fixup: a single AD9910/9952/9954 register write is one
@@ -861,6 +811,14 @@ static mp_obj_t machine_spi_dma_periodic_isr_count(mp_obj_t self_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(machine_spi_dma_periodic_isr_count_obj, machine_spi_dma_periodic_isr_count);
 
+// Diagnostic-only: see spi_dma_io_update_isr_count's own comment above
+// (LPSPI4_IRQHandler).
+static mp_obj_t machine_spi_dma_periodic_io_update_isr_count(mp_obj_t self_in) {
+    (void)self_in;
+    return mp_obj_new_int_from_uint(spi_dma_io_update_isr_count);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(machine_spi_dma_periodic_io_update_isr_count_obj, machine_spi_dma_periodic_io_update_isr_count);
+
 static mp_obj_t machine_spi_dma_periodic_stop(mp_obj_t self_in) {
     machine_spi_obj_t *self = MP_OBJ_TO_PTR(self_in);
     if (!self->dma_periodic_active) {
@@ -876,18 +834,12 @@ static mp_obj_t machine_spi_dma_periodic_stop(mp_obj_t self_in) {
     DMAMUX_DisableChannel(DMAMUX, SPI_DMA_DMAMUX_CHANNEL);
     LPSPI_DisableDMA(self->spi_inst, kLPSPI_TxDmaEnable);
     PIT_StopTimer(PIT, SPI_DMA_PIT_CHANNEL);
-    if (self->dma_io_update_set_channel >= 0) {
-        EDMA_AbortTransfer(&self->dma_io_update_set_edmaHandle);
-        free_dma_channel(self->dma_io_update_set_channel);
-        self->dma_io_update_set_channel = -1;
-    }
-    if (self->dma_io_update_clear_channel >= 0) {
-        EDMA_AbortTransfer(&self->dma_io_update_clear_edmaHandle);
-        free_dma_channel(self->dma_io_update_clear_channel);
-        self->dma_io_update_clear_channel = -1;
-    }
-    PIT_StopTimer(PIT, SPI_DMA_IO_UPDATE_RISE_PIT_CHANNEL);
-    PIT_StopTimer(PIT, SPI_DMA_IO_UPDATE_FALL_PIT_CHANNEL);
+    // I/O_UPDATE: disable LPSPI4's Frame-Complete interrupt (harmless no-op if
+    // dma_periodic_start() was called with io_update_duty_u16 == 0, since it was never
+    // enabled). NVIC IRQ itself is left enabled permanently once armed the first time --
+    // disabling the interrupt SOURCE here is sufficient, no need to churn EnableIRQ/
+    // DisableIRQ on every start/stop cycle.
+    LPSPI_DisableInterrupts(self->spi_inst, (uint32_t)kLPSPI_FrameCompleteInterruptEnable);
     self->dma_periodic_active = false;
     self->dma_refill_callback = MP_OBJ_NULL;
     return mp_const_none;
@@ -930,6 +882,7 @@ static const mp_rom_map_elem_t machine_spi_mimxrt_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_dma_periodic_write), MP_ROM_PTR(&machine_spi_dma_periodic_write_obj) },
     { MP_ROM_QSTR(MP_QSTR_dma_periodic_stop), MP_ROM_PTR(&machine_spi_dma_periodic_stop_obj) },
     { MP_ROM_QSTR(MP_QSTR_dma_periodic_isr_count), MP_ROM_PTR(&machine_spi_dma_periodic_isr_count_obj) },
+    { MP_ROM_QSTR(MP_QSTR_dma_periodic_io_update_isr_count), MP_ROM_PTR(&machine_spi_dma_periodic_io_update_isr_count_obj) },
 };
 MP_DEFINE_CONST_DICT(mp_machine_spi_mimxrt_locals_dict, machine_spi_mimxrt_locals_dict_table);
 
