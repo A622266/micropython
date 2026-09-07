@@ -591,6 +591,18 @@ static mp_obj_t machine_spi_dma_periodic_start(size_t n_args, const mp_obj_t *ar
     };
     XBARA_SetOutputSignalConfig(XBARA1, SPI_DMA_XBAR_OUTPUT, &xbar_ctrl_config);
 
+    // DMAMUX and eDMA (DMA0) must both be initialized before ANY channel is touched --
+    // moved up here (both idempotent, DMAMUX_Init() resets/enables the whole module and
+    // dma_init() itself is internally guarded against being called twice) because the
+    // I/O_UPDATE block below now also allocates/configures two eDMA channels, and this
+    // was originally placed further down, after that block -- a real bug found on the
+    // bench (2026-09-06 revision 2): with initialization still below, the I/O_UPDATE
+    // channels' EDMA_CreateHandle()/DMAMUX_SetSource() calls ran against an
+    // uninitialized DMAMUX/DMA0, hanging the board before dma_periodic_start() could
+    // ever return.
+    dma_init();
+    DMAMUX_Init(DMAMUX);
+
     // --- I/O_UPDATE on pin D15, via PIT channels 1/2 + XBARA1 + two small self-linked
     // eDMA channels toggling GPIO1 directly (DR_SET/DR_CLEAR). See the module-level
     // comment for why this replaced TMR3's PWM (a real, bench-confirmed clock-domain
@@ -725,20 +737,17 @@ static mp_obj_t machine_spi_dma_periodic_start(size_t n_args, const mp_obj_t *ar
     uint32_t frame_bits = (uint32_t)self->dma_frame_bytes * 8;
     self->spi_inst->TCR = (self->spi_inst->TCR & ~LPSPI_TCR_FRAMESZ_MASK) | LPSPI_TCR_FRAMESZ(frame_bits - 1);
 
-    // --- eDMA: QTMR2-triggered, ring buffer -> LPSPI TDR, self-linked TCD for
-    // continuous circular operation (same construct machine_i2s.c uses).
+    // --- eDMA: PIT-triggered, ring buffer -> LPSPI TDR, self-linked TCD for
+    // continuous circular operation (same construct machine_i2s.c uses). DMAMUX_Init()/
+    // dma_init() already ran above (moved there so the I/O_UPDATE channels have an
+    // initialized DMAMUX/DMA0 to configure too) -- not repeated here.
     self->dma_channel = allocate_dma_channel();
     if (self->dma_channel < 0) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("no DMA channel available"));
     }
-    DMAMUX_Init(DMAMUX);
     DMAMUX_SetSource(DMAMUX, self->dma_channel, SPI_DMA_DMAMUX_SRC);
     DMAMUX_EnableChannel(DMAMUX, self->dma_channel);
 
-    // Idempotent (guarded internally) -- must still be called here rather than assumed
-    // already done by some other peripheral's constructor (e.g. machine_i2s.c's own
-    // i2s_init() also calls this), since this SPI object may be the first DMA user.
-    dma_init();
     EDMA_CreateHandle(&self->dma_edmaHandle, DMA0, self->dma_channel);
     EDMA_SetCallback(&self->dma_edmaHandle, edma_spi_periodic_callback, self);
     EDMA_ResetChannel(DMA0, self->dma_channel);
@@ -748,7 +757,7 @@ static mp_obj_t machine_spi_dma_periodic_start(size_t n_args, const mp_obj_t *ar
     // bytes) -- dma_frame_bytes (e.g. 9 for an AD9910 write) is NOT a valid width and an
     // earlier version of this patch wrongly passed it as one. Fixed: beats are always
     // 1 byte wide; dma_frame_bytes instead sets the MINOR LOOP byte count (how many
-    // 1-byte beats fire back-to-back per single QTMR-sourced DMA request) -- this is the
+    // 1-byte beats fire back-to-back per single PIT-sourced DMA request) -- this is the
     // standard eDMA minor-loop/major-loop split, not a workaround.
     edma_transfer_config_t transferConfig;
     EDMA_PrepareTransfer(&transferConfig,
