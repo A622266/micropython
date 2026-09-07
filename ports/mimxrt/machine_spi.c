@@ -952,7 +952,16 @@ void PIT_IRQHandler(void) {
         // against a directly register-verified 192kHz PIT period).
         (void)PIT_GetStatusFlags(PIT, SPI_ISR_PIT_CHANNEL);
         if (spi_isr_periodic_active && spi_isr_lpspi != NULL) {
+            // Poll FSR.TXCOUNT before each byte, waiting for FIFO room -- LPSPI4's TX
+            // FIFO is only 4 words deep (confirmed via PARAM register readback), and a
+            // raw STR to TDR is NOT paced against peripheral readiness the way eDMA bus
+            // transactions are; writing blindly into a full FIFO can silently lose
+            // bytes rather than stall, decoupling the wire from the intended one-frame-
+            // per-interrupt boundary. Safe to busy-wait here: worst case is ~4 byte
+            // times (~1.6us at 20MHz baud), far under the interrupt period.
             for (size_t i = 0; i < spi_isr_frame_bytes; i++) {
+                while ((spi_isr_lpspi->FSR & LPSPI_FSR_TXCOUNT_MASK) >= 4U) {
+                }
                 spi_isr_lpspi->TDR = spi_isr_frame_buf[i];
             }
             spi_isr_periodic_count++;
