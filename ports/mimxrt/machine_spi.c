@@ -967,6 +967,32 @@ void PIT_IRQHandler(void) {
         // against a directly register-verified 192kHz PIT period).
         (void)PIT_GetStatusFlags(PIT, SPI_ISR_PIT_CHANNEL);
         if (spi_isr_periodic_active && spi_isr_lpspi != NULL) {
+            // I/O_UPDATE for the PREVIOUS tick's frame, before queuing this tick's new
+            // content -- NOT the LPSPI4 Frame-Complete-interrupt approach dma_periodic_
+            // start() uses. That approach was bench-tested here (2026-09-07) and, despite
+            // proving perfectly correct on every measurable metric (bit-perfect wire
+            // content, exact 1:1 I/O_UPDATE-per-frame correlation, correct pacing),
+            // produced NO usable RF output at all -- not wrong-frequency, just silent --
+            // reproduced even at a much slower 1kHz rate, ruling out "too fast for the
+            // DDS." Root cause not understood (possibly a latent issue in the shared FCF
+            // mechanism itself, never actually validated against real RF output before
+            // since dma_periodic_start()'s own DMAMUX jitter always masked it). Falling
+            // back to the simpler, ALREADY-proven-correct approach instead: this ISR
+            // fires once every full frame period (5.2us at 192kHz), comfortably longer
+            // than one 9-byte frame's ~4.27us shift time, so by construction the frame
+            // queued on the PREVIOUS tick has always finished shifting out completely by
+            // now, before any of THIS tick's new content is written -- pulsing here, in
+            // that guaranteed-idle gap, latches it safely without needing a second
+            // interrupt source or any assumption about FCF timing at all.
+            if (spi_isr_io_update_enabled) {
+                SPI_DMA_IO_UPDATE_GPIO_BASE->DR_SET = (1u << SPI_DMA_IO_UPDATE_GPIO_BIT);
+                // See LPSPI4_IRQHandler's own comment on why no explicit delay is needed
+                // between DR_SET and DR_CLEAR: AD9910's I/O_UPDATE minimum pulse width
+                // (">1 SYNC_CLK cycle", a handful of ns) is far shorter than the
+                // instructions between these two writes already take at 600MHz.
+                SPI_DMA_IO_UPDATE_GPIO_BASE->DR_CLEAR = (1u << SPI_DMA_IO_UPDATE_GPIO_BIT);
+            }
+
             // Pack the current ring-buffer frame into ceil(frame_bytes*8/32) genuine
             // 32-bit WORDS and write TDR exactly that many times -- NOT once per
             // content byte. See the fork's commit history (621030168) for the full
@@ -1075,11 +1101,17 @@ static mp_obj_t machine_spi_isr_periodic_start(size_t n_args, const mp_obj_t *ar
     }
     PIT_SetTimerPeriod(PIT, SPI_ISR_PIT_CHANNEL, pit_ticks);
 
-    // I/O_UPDATE on D15, via the SAME LPSPI4 Frame-Complete interrupt dma_periodic_start()
-    // uses (see LPSPI4_IRQHandler and SPI_DMA_IO_UPDATE_GPIO_BASE/BIT's own comments
-    // above) -- shared physical pin/mechanism, not duplicated logic. That handler is
-    // mechanism-agnostic: it just pulses D15 whenever LPSPI reports a frame complete,
-    // regardless of what fed TDR.
+    // I/O_UPDATE on D15, pulsed directly from PIT_IRQHandler itself (see its own
+    // comment) -- NOT via LPSPI4's Frame-Complete interrupt the way dma_periodic_start()
+    // does it. That approach was tried first and bench-tested here (2026-09-07): it
+    // proved perfectly correct on every measurable metric (bit-perfect wire content,
+    // exact 1:1 I/O_UPDATE-per-frame correlation, correct pacing) yet produced NO usable
+    // RF output at all, even at a much slower 1kHz rate -- root cause not understood,
+    // possibly a latent issue in that shared FCF mechanism itself, which was never
+    // actually validated against real RF output before (dma_periodic_start()'s own
+    // DMAMUX jitter always masked it). This just sets up the GPIO pin here; the actual
+    // pulsing happens once per ISR tick, for the previous tick's already-fully-shifted
+    // frame.
     spi_isr_io_update_enabled = (io_update_enable != 0);
     if (spi_isr_io_update_enabled) {
         IOMUXC_SetPinMux(IOMUXC_GPIO_AD_B1_03_GPIO1_IO19, 0U);
@@ -1087,9 +1119,6 @@ static mp_obj_t machine_spi_isr_periodic_start(size_t n_args, const mp_obj_t *ar
             pin_generate_config(PIN_PULL_UP_100K, PIN_MODE_OUT, DEFAULT_SPI_DRIVE, 0x401F82F8U));
         SPI_DMA_IO_UPDATE_GPIO_BASE->GDIR |= (1u << SPI_DMA_IO_UPDATE_GPIO_BIT);
         SPI_DMA_IO_UPDATE_GPIO_BASE->DR_CLEAR = (1u << SPI_DMA_IO_UPDATE_GPIO_BIT); // start low
-        LPSPI_ClearStatusFlags(self->spi_inst, (uint32_t)kLPSPI_FrameCompleteFlag);
-        LPSPI_EnableInterrupts(self->spi_inst, (uint32_t)kLPSPI_FrameCompleteInterruptEnable);
-        EnableIRQ(LPSPI4_IRQn);
     }
 
     // Set active BEFORE the synchronous refill calls below, matching dma_periodic_
@@ -1154,15 +1183,7 @@ static mp_obj_t machine_spi_isr_periodic_stop(mp_obj_t self_in) {
     spi_isr_periodic_active = false;
     PIT_StopTimer(PIT, SPI_ISR_PIT_CHANNEL);
     PIT_DisableInterrupts(PIT, SPI_ISR_PIT_CHANNEL, (uint32_t)kPIT_TimerInterruptEnable);
-    if (spi_isr_io_update_enabled) {
-        // Harmless if dma_periodic_start() also enabled the same interrupt for its own
-        // use -- not intended to run concurrently with this mechanism (see the module
-        // comment), and disabling here just means "this mechanism no longer needs it,"
-        // matching dma_periodic_stop()'s own comment about not churning EnableIRQ/
-        // DisableIRQ on the NVIC itself.
-        LPSPI_DisableInterrupts(spi_isr_lpspi, (uint32_t)kLPSPI_FrameCompleteInterruptEnable);
-        spi_isr_io_update_enabled = false;
-    }
+    spi_isr_io_update_enabled = false;
     spi_isr_lpspi = NULL;
     spi_isr_refill_callback = MP_OBJ_NULL;
     spi_isr_buffer = NULL;
