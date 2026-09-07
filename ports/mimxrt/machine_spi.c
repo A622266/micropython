@@ -942,6 +942,15 @@ volatile uint32_t spi_isr_periodic_count = 0;
 void PIT_IRQHandler(void) {
     if ((PIT_GetStatusFlags(PIT, SPI_ISR_PIT_CHANNEL) & (uint32_t)kPIT_TimerFlag) != 0) {
         PIT_ClearStatusFlags(PIT, SPI_ISR_PIT_CHANNEL, (uint32_t)kPIT_TimerFlag);
+        // Dummy read-back immediately after the write-1-to-clear write, before doing
+        // anything else -- same bug class bench-found and fixed for LPSPI4's
+        // Frame-Complete interrupt earlier tonight: the TFLG write is posted on the bus
+        // and may not have completed by the time this ISR would otherwise return,
+        // letting the NVIC see the flag still asserted and re-enter immediately for the
+        // same real timer event. Bench-confirmed here too: without this, the observed
+        // TDR-write rate ran at several times the programmed 192kHz (measured ~693kHz
+        // against a directly register-verified 192kHz PIT period).
+        (void)PIT_GetStatusFlags(PIT, SPI_ISR_PIT_CHANNEL);
         if (spi_isr_periodic_active && spi_isr_lpspi != NULL) {
             for (size_t i = 0; i < spi_isr_frame_bytes; i++) {
                 spi_isr_lpspi->TDR = spi_isr_frame_buf[i];
