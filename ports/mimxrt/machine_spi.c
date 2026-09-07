@@ -935,7 +935,28 @@ extern const mp_obj_fun_builtin_fixed_t machine_spi_deinit_obj; // MP_DEFINE_CON
 // writes via isr_periodic_write(), ISR-side reads below) -- no separate DMA bus master
 // is involved, so ordinary Cortex-M7 cache coherency between CPU loads/stores already
 // applies and no DCACHE_CleanByRange() calls are needed here, unlike the DMA mechanism.
-#define SPI_ISR_FRAMES_PER_HALF (64)
+//
+// Was 64 until 2026-09-08. Found the hard way with a real weaver_native-driven content
+// source: a refill() call that has to compute a fresh DSP block (~2.4ms for
+// drivers/weaver_pipeline.py's BLOCK_SIZE=1024) takes far longer than one 64-frame half
+// takes to PLAY (64/192kHz = 333us) -- so the double-buffering assumption ("the ISR is
+// always reading the OTHER half from the one Python is writing") silently breaks:
+// the ISR laps the slow refill and starts reading a half that's still being written,
+// a genuine torn read producing a jumbled mix of stale and fresh FTW bytes within one
+// playback sequence. This is NOT caught by any per-sample content sanity check (each
+// individual value written is perfectly valid; it's the READ-WHILE-WRITE timing that's
+// corrupted) and only manifests probabilistically depending on the exact interleaving,
+// which is why it took ~3-4 seconds (not immediately) to visibly corrupt AD9910's
+// state in that bench test, and why a constant-content refill (no expensive per-call
+// compute, always sub-microsecond writes) ran cleanly for 15+ seconds with the exact
+// same automatic-I/O_UPDATE mechanism -- ruling out the mechanism itself and pointing
+// straight at this half-size-vs-refill-cost mismatch. Bumped to 1024 to match
+// weaver_pipeline.py's own BLOCK_SIZE exactly: a half's ~5.33ms playback time then
+// comfortably exceeds the ~2.4-2.5ms it takes to compute+pack that same content
+// (~2.1x margin), restoring genuine double-buffering. A caller with a cheaper content
+// source (like the constant-content tests) is unaffected either way -- this only
+// changes how much gets buffered ahead, not correctness for a fast refill.
+#define SPI_ISR_FRAMES_PER_HALF (1024)
 
 static volatile bool spi_isr_periodic_active = false;
 static size_t spi_isr_frame_bytes = 0;
