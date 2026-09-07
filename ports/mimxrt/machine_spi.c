@@ -240,8 +240,12 @@
 // paired with PIT channel 0 per the RM's fixed table -- which happens to already be
 // SPI_DMA_PIT_CHANNEL below, so no PIT channel renumbering was needed, only the DMAMUX
 // routing changed.
-#define SPI_DMA_PIT_CHANNEL         kPIT_Chnl_0
-#define SPI_DMA_DMAMUX_CHANNEL      (0u)
+// EXPERIMENT (2026-09-07): moved from PIT channel 0 / DMAMUX channel 0 to channel 1, to
+// test whether the bench-observed 3-cycle "2 tight + 1 loose" trigger-latency jitter
+// (manifesting as real 64kHz-fundamental corruption on the AD9910 analog output, exactly
+// rate_hz/3) is specific to channel 0 or general to the periodic-trigger mechanism.
+#define SPI_DMA_PIT_CHANNEL         kPIT_Chnl_1
+#define SPI_DMA_DMAMUX_CHANNEL      (1u)
 #define SPI_DMA_LPSPI4_TX_DMAMUX_SRC kDmaRequestMuxLPSPI4Tx
 
 // I/O_UPDATE on pin D15 (GPIO1 bit 19): toggled directly from LPSPI4's own Frame-
@@ -903,6 +907,139 @@ static void machine_spi_deinit_hw(mp_obj_base_t *self_in) {
 extern const mp_obj_fun_builtin_var_t machine_spi_init_obj;    // MP_DEFINE_CONST_FUN_OBJ_KW
 extern const mp_obj_fun_builtin_fixed_t machine_spi_deinit_obj; // MP_DEFINE_CONST_FUN_OBJ_1
 
+// --- ISR-driven periodic SPI (2026-09-07) -- alternative to dma_periodic_start() that
+// bypasses DMAMUX/eDMA's periodic-trigger mechanism entirely. Bench testing found that
+// mechanism has an inherent, non-eliminable trigger-to-transfer timing-jitter artifact
+// (a deterministic "2 tight + 1 loose"-style cyclic pattern) reproduced across every
+// rate_hz, DMAMUX channel, and PIT channel tried, corrupting AD9910's serial-port
+// framing even though the SPI content itself was proven bit-perfect and the long-run
+// average rate was often correct. PIT-driven CPU interrupts, in contrast, are the ONE
+// timing mechanism bench-confirmed EXACTLY jitter-free in this file (I/O_UPDATE's own
+// timing, before it was replaced by the LPSPI4 Frame-Complete interrupt). This
+// mechanism writes each frame's bytes directly to LPSPI's TDR register from the PIT
+// ISR, once per configured period, with zero DMA/DMAMUX involvement -- CPU-driven, not
+// hardware-autonomous, so it costs real cycles at rate_hz (unlike the DMA approach),
+// but sidesteps DMAMUX's demonstrated unreliability entirely.
+//
+// Uses PIT channel 1 (SPI_ISR_PIT_CHANNEL) -- deliberately NOT channel 0
+// (SPI_DMA_PIT_CHANNEL), so this mechanism can coexist with (though is not intended to
+// run concurrently with) the existing dma_periodic_* API without a channel conflict.
+// Global/static state (not part of machine_spi_obj_t) because the ISR has no way to
+// recover a `self` pointer -- matches this file's existing single-instance-only design
+// for all its periodic-transfer extensions.
+#define SPI_ISR_PIT_CHANNEL kPIT_Chnl_1
+
+static volatile bool spi_isr_periodic_active = false;
+static size_t spi_isr_frame_bytes = 0;
+static uint8_t spi_isr_frame_buf[16];
+static LPSPI_Type *spi_isr_lpspi = NULL;
+volatile uint32_t spi_isr_periodic_count = 0;
+
+// Overrides the .weak default in startup_MIMXRT1062.S. PIT has a single shared IRQ
+// vector for all 4 channels (MIMXRT1062.h: "PIT interrupt", not per-channel) -- check
+// and clear this specific channel's own flag before acting, in case some other future
+// PIT user shares the vector.
+void PIT_IRQHandler(void) {
+    if ((PIT_GetStatusFlags(PIT, SPI_ISR_PIT_CHANNEL) & (uint32_t)kPIT_TimerFlag) != 0) {
+        PIT_ClearStatusFlags(PIT, SPI_ISR_PIT_CHANNEL, (uint32_t)kPIT_TimerFlag);
+        if (spi_isr_periodic_active && spi_isr_lpspi != NULL) {
+            for (size_t i = 0; i < spi_isr_frame_bytes; i++) {
+                spi_isr_lpspi->TDR = spi_isr_frame_buf[i];
+            }
+            spi_isr_periodic_count++;
+        }
+    }
+}
+
+// spi.isr_periodic_start(frame_bytes, rate_hz, initial_buf) -- initial_buf (required, not
+// optional) sidesteps the same "trigger starts before real content is ready" race that
+// was found and fixed in dma_periodic_start(); there's no separate priming step here.
+static mp_obj_t machine_spi_isr_periodic_start(size_t n_args, const mp_obj_t *args) {
+    machine_spi_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    mp_int_t frame_bytes = mp_obj_get_int(args[1]);
+    mp_int_t rate_hz = mp_obj_get_int(args[2]);
+    mp_buffer_info_t buf;
+    mp_get_buffer_raise(args[3], &buf, MP_BUFFER_READ);
+
+    if (frame_bytes <= 0 || frame_bytes > 16) {
+        mp_raise_ValueError(MP_ERROR_TEXT("frame_bytes out of range"));
+    }
+    if ((mp_int_t)buf.len != frame_bytes) {
+        mp_raise_ValueError(MP_ERROR_TEXT("initial buffer wrong length"));
+    }
+    if (spi_isr_periodic_active) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("isr_periodic already active"));
+    }
+
+    memcpy(spi_isr_frame_buf, buf.buf, (size_t)frame_bytes);
+    spi_isr_frame_bytes = (size_t)frame_bytes;
+    spi_isr_lpspi = self->spi_inst;
+
+    // Widen FRAMESZ -- same read-modify-write precondition as dma_periodic_start() (at
+    // least one prior blocking spi.write()/write_readinto() must have already run on
+    // this object, establishing TCR's CPOL/CPHA/byte-order baseline).
+    uint32_t frame_bits = (uint32_t)frame_bytes * 8;
+    self->spi_inst->TCR = (self->spi_inst->TCR & ~LPSPI_TCR_FRAMESZ_MASK) | LPSPI_TCR_FRAMESZ(frame_bits - 1);
+
+    pit_config_t pit_config;
+    PIT_GetDefaultConfig(&pit_config);
+    PIT_Init(PIT, &pit_config);
+    uint32_t perclk_hz = CLOCK_GetPerClkFreq();
+    uint32_t pit_ticks = perclk_hz / (uint32_t)rate_hz;
+    if (pit_ticks == 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("rate_hz too high to represent on PIT"));
+    }
+    PIT_SetTimerPeriod(PIT, SPI_ISR_PIT_CHANNEL, pit_ticks);
+    PIT_EnableInterrupts(PIT, SPI_ISR_PIT_CHANNEL, (uint32_t)kPIT_TimerInterruptEnable);
+    EnableIRQ(PIT_IRQn);
+
+    spi_isr_periodic_active = true;
+    PIT_StartTimer(PIT, SPI_ISR_PIT_CHANNEL);
+
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(machine_spi_isr_periodic_start_obj, 4, 4, machine_spi_isr_periodic_start);
+
+// spi.isr_periodic_write(buf) -- update the frame content the ISR sends each tick.
+static mp_obj_t machine_spi_isr_periodic_write(mp_obj_t self_in, mp_obj_t buf_in) {
+    (void)self_in;
+    if (!spi_isr_periodic_active) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("isr_periodic not active"));
+    }
+    mp_buffer_info_t buf;
+    mp_get_buffer_raise(buf_in, &buf, MP_BUFFER_READ);
+    if (buf.len != spi_isr_frame_bytes) {
+        mp_raise_ValueError(MP_ERROR_TEXT("buffer wrong length"));
+    }
+    // Briefly disable the PIT interrupt to make the buffer swap atomic (avoid the ISR
+    // reading a torn write mid-copy) -- cheap, since this write path only runs at
+    // whatever (much slower) rate the caller updates content, not at rate_hz itself.
+    PIT_DisableInterrupts(PIT, SPI_ISR_PIT_CHANNEL, (uint32_t)kPIT_TimerInterruptEnable);
+    memcpy(spi_isr_frame_buf, buf.buf, buf.len);
+    PIT_EnableInterrupts(PIT, SPI_ISR_PIT_CHANNEL, (uint32_t)kPIT_TimerInterruptEnable);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(machine_spi_isr_periodic_write_obj, machine_spi_isr_periodic_write);
+
+static mp_obj_t machine_spi_isr_periodic_stop(mp_obj_t self_in) {
+    (void)self_in;
+    if (!spi_isr_periodic_active) {
+        return mp_const_none;
+    }
+    PIT_StopTimer(PIT, SPI_ISR_PIT_CHANNEL);
+    PIT_DisableInterrupts(PIT, SPI_ISR_PIT_CHANNEL, (uint32_t)kPIT_TimerInterruptEnable);
+    spi_isr_periodic_active = false;
+    spi_isr_lpspi = NULL;
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(machine_spi_isr_periodic_stop_obj, machine_spi_isr_periodic_stop);
+
+static mp_obj_t machine_spi_isr_periodic_count(mp_obj_t self_in) {
+    (void)self_in;
+    return mp_obj_new_int_from_uint(spi_isr_periodic_count);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(machine_spi_isr_periodic_count_obj, machine_spi_isr_periodic_count);
+
 static const mp_rom_map_elem_t machine_spi_mimxrt_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_init), MP_ROM_PTR(&machine_spi_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&machine_spi_deinit_obj) },
@@ -917,6 +1054,10 @@ static const mp_rom_map_elem_t machine_spi_mimxrt_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_dma_periodic_stop), MP_ROM_PTR(&machine_spi_dma_periodic_stop_obj) },
     { MP_ROM_QSTR(MP_QSTR_dma_periodic_isr_count), MP_ROM_PTR(&machine_spi_dma_periodic_isr_count_obj) },
     { MP_ROM_QSTR(MP_QSTR_dma_periodic_io_update_isr_count), MP_ROM_PTR(&machine_spi_dma_periodic_io_update_isr_count_obj) },
+    { MP_ROM_QSTR(MP_QSTR_isr_periodic_start), MP_ROM_PTR(&machine_spi_isr_periodic_start_obj) },
+    { MP_ROM_QSTR(MP_QSTR_isr_periodic_write), MP_ROM_PTR(&machine_spi_isr_periodic_write_obj) },
+    { MP_ROM_QSTR(MP_QSTR_isr_periodic_stop), MP_ROM_PTR(&machine_spi_isr_periodic_stop_obj) },
+    { MP_ROM_QSTR(MP_QSTR_isr_periodic_count), MP_ROM_PTR(&machine_spi_isr_periodic_count_obj) },
 };
 MP_DEFINE_CONST_DICT(mp_machine_spi_mimxrt_locals_dict, machine_spi_mimxrt_locals_dict_table);
 
